@@ -131,8 +131,16 @@ def extract_graph_refresh_token(
     log: Optional[Callable[[str], None]] = None,
     session_factory: Optional[Callable[[], Any]] = None,
     proxy_url: str = None,
+    bind_secondary: Any = None,
 ) -> Dict[str, Any]:
-    """使用纯 HTTP OAuth2 授权码流程提取 Outlook refresh_token。"""
+    """使用纯 HTTP OAuth2 授权码流程提取 Outlook refresh_token。
+
+    bind_secondary 真值时,流程到达 proofs/Add 会尝试绑定 CF 辅助邮箱
+    (create_or_get_address + bind_proof_in_session),成功后 recovery_email/
+    recovery_email_password 随成功 dict 返回,由调用方透传给 upsert。
+    """
+    _pending_recovery_email = ""
+    _pending_recovery_password = ""
     try:
         session = session_factory() if session_factory else requests.Session()
         resolved_proxy = str(proxy_url or '').strip()
@@ -317,6 +325,29 @@ def extract_graph_refresh_token(
                 continue
 
             if "proofs/Add" in current_url or "proofs/add" in current_url:
+                if bind_secondary:
+                    try:
+                        cf_info = create_or_get_address(email)
+                        cf_address = cf_info.get("address")
+                        cf_jwt = cf_info.get("jwt")
+                        cf_pw = cf_info.get("password") or ""
+                        use_admin = cf_info.get("use_admin", False)
+                    except Exception as exc:
+                        graph_oauth_log(log, f"CF 辅助邮箱分配失败，回退 Skip: {exc}")
+                        cf_address = None
+                    if cf_address:
+                        bound_resp = bind_proof_in_session(
+                            session, text, current_url,
+                            cf_address=cf_address, cf_jwt=cf_jwt,
+                            use_admin=use_admin, idx=0,
+                        )
+                        if bound_resp is not None:
+                            resp2 = bound_resp
+                            _pending_recovery_email = cf_address
+                            _pending_recovery_password = cf_pw
+                            continue
+                        graph_oauth_log(log, "bind 失败，回退 Skip proofs/Add")
+                # 回退 / 未启用绑定：原 Skip 逻辑
                 form_match = re.search(
                     r'<form[^>]*action="([^"]+)"[^>]*>(.*?)</form>',
                     text,
@@ -394,6 +425,8 @@ def extract_graph_refresh_token(
             "success": True,
             "refresh_token": refresh_token,
             "client_id": client_id,
+            "recovery_email": _pending_recovery_email,
+            "recovery_email_password": _pending_recovery_password,
         }
     except Exception as exc:
         return make_graph_oauth_response(False, f"异常: {type(exc).__name__}", str(exc))
@@ -417,7 +450,9 @@ def upsert_graph_authorized_account(email: str, password: str, client_id: str,
                                     proxy_url: str = '',
                                     tag_ids: Any = None,
                                     remark: str = '',
-                                    authorization_type: Optional[str] = None) -> Dict[str, Any]:
+                                    authorization_type: Optional[str] = None,
+                                    recovery_email: str = '',
+                                    recovery_email_password: str = '') -> Dict[str, Any]:
     db = get_db()
     existing = db.execute(
         'SELECT id, authorization_type FROM accounts WHERE LOWER(email) = ? LIMIT 1',
@@ -425,6 +460,7 @@ def upsert_graph_authorized_account(email: str, password: str, client_id: str,
     ).fetchone()
     encrypted_password = encrypt_data(password) if password else password
     encrypted_refresh_token = encrypt_data(refresh_token) if refresh_token else refresh_token
+    encrypted_recovery_password = encrypt_data(recovery_email_password) if recovery_email_password else recovery_email_password
     if authorization_type is None:
         normalized_authorization_type = normalize_outlook_authorization_type(
             existing['authorization_type'] if existing else ''
@@ -447,13 +483,16 @@ def upsert_graph_authorized_account(email: str, password: str, client_id: str,
                 account_type = 'outlook',
                 provider = 'outlook',
                 authorization_type = ?,
+                recovery_email = ?,
+                recovery_email_password = ?,
                 refresh_token_updated_at = CURRENT_TIMESTAMP,
                 last_refresh_status = 'never',
                 last_refresh_error = NULL,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             ''',
-            (encrypted_password, client_id, encrypted_refresh_token, normalized_authorization_type, account_id),
+            (encrypted_password, client_id, encrypted_refresh_token, normalized_authorization_type,
+             recovery_email, encrypted_recovery_password, account_id),
         )
         return {"account_id": account_id, "created": False}
 
@@ -477,6 +516,8 @@ def upsert_graph_authorized_account(email: str, password: str, client_id: str,
         normalized_proxy,
         '',
         '',
+        recovery_email,
+        recovery_email_password,
     ))
     account_id = int(cursor.lastrowid)
     apply_account_tag_ids(account_id, tag_ids, db)
@@ -509,7 +550,9 @@ def mark_upload_account_authorized(account_id: int) -> None:
 
 def save_graph_authorization_result(upload_row: Any, client_id: str,
                                     refresh_token: str,
-                                    authorization_type: Optional[str] = None) -> Dict[str, Any]:
+                                    authorization_type: Optional[str] = None,
+                                    recovery_email: str = '',
+                                    recovery_email_password: str = '') -> Dict[str, Any]:
     email = str(upload_row['email'] or '').strip()
     password = get_upload_account_plain_password(upload_row)
     row_data = dict(upload_row) if hasattr(upload_row, 'keys') else {}
@@ -523,6 +566,8 @@ def save_graph_authorization_result(upload_row: Any, client_id: str,
         tag_ids=decode_upload_tag_ids(row_data.get('tag_ids')),
         remark=str(row_data.get('remark') or ''),
         authorization_type=authorization_type,
+        recovery_email=recovery_email,
+        recovery_email_password=recovery_email_password,
     )
     mark_upload_account_authorized(int(upload_row['id']))
     get_db().commit()
@@ -613,11 +658,15 @@ def run_graph_oauth_task(account_id: int, output_queue: "queue.Queue[Dict[str, A
                 return
 
             token_to_save = rotated_refresh_token or refresh_token
+            recovery_email = str(result.get("recovery_email") or "")
+            recovery_email_password = str(result.get("recovery_email_password") or "")
             save_result = save_graph_authorization_result(
                 upload_row,
                 client_id,
                 token_to_save,
                 authorization_type=actual_channel or mode,
+                recovery_email=recovery_email,
+                recovery_email_password=recovery_email_password,
             )
             emit({
                 "type": "success",

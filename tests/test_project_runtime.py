@@ -4016,5 +4016,173 @@ class BindProofTests(unittest.TestCase):
         self.assertIn("cm_module", params)
 
 
+class OauthBindIntegrationTests(unittest.TestCase):
+    """F3.3:OAuth 流程接入辅助邮箱绑定 + upsert 透传 recovery 字段。"""
+
+    def setUp(self):
+        self.app = web_outlook_app.app
+        self.app.config['TESTING'] = True
+        self.app.config['WTF_CSRF_ENABLED'] = False
+        self.client = self.app.test_client()
+        with self.app.app_context():
+            web_outlook_app.init_db()
+            web_outlook_app.set_setting(
+                web_outlook_app.LOGIN_SESSION_VERSION_SETTING_KEY,
+                web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION,
+            )
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM accounts')
+            web_outlook_app.set_setting('login_password', web_outlook_app.hash_password('export-pass'))
+            db.commit()
+        with self.client.session_transaction() as sess:
+            sess['logged_in'] = True
+            sess['login_session_version'] = web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION
+
+    def test_upsert_graph_authorized_account_persists_recovery_fields_new_account(self):
+        """新建分支:upsert 透传 recovery_email/recovery_email_password 到主表(加密)。"""
+        with self.app.app_context():
+            result = web_outlook_app.upsert_graph_authorized_account(
+                "bindacc@x.com", "pw", "cid", "rt",
+                recovery_email="ms-bindacc@cf.com",
+                recovery_email_password="auxpw",
+                authorization_type="graph",
+            )
+            self.assertTrue(result["created"])
+            row = web_outlook_app.get_db().execute(
+                "SELECT recovery_email, recovery_email_password FROM accounts WHERE email = ?",
+                ("bindacc@x.com",),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["recovery_email"], "ms-bindacc@cf.com")
+            # recovery_email_password 应加密存储(非明文 auxpw)
+            self.assertNotEqual(row["recovery_email_password"], "auxpw")
+            self.assertTrue(row["recovery_email_password"])  # 非空
+
+    def test_upsert_graph_authorized_account_persists_recovery_fields_existing_account(self):
+        """已有账号分支:UPDATE 也要写入 recovery 两列(加密密码)。"""
+        with self.app.app_context():
+            # 先建账号(无 recovery)
+            web_outlook_app.upsert_graph_authorized_account("bindacc2@x.com", "pw", "cid", "rt1", authorization_type="graph")
+            # 再 upsert 带 recovery(走 existing UPDATE 分支)
+            result = web_outlook_app.upsert_graph_authorized_account(
+                "bindacc2@x.com", "pw", "cid", "rt2",
+                recovery_email="ms-bindacc2@cf.com",
+                recovery_email_password="auxpw2",
+                authorization_type="graph",
+            )
+            self.assertFalse(result["created"])
+            row = web_outlook_app.get_db().execute(
+                "SELECT recovery_email, recovery_email_password FROM accounts WHERE email = ?",
+                ("bindacc2@x.com",),
+            ).fetchone()
+            self.assertEqual(row["recovery_email"], "ms-bindacc2@cf.com")
+            self.assertNotEqual(row["recovery_email_password"], "auxpw2")
+
+    def test_upsert_graph_authorized_account_recovery_defaults_empty(self):
+        """不传 recovery 时默认空字符串,不影响原有行为。"""
+        with self.app.app_context():
+            web_outlook_app.upsert_graph_authorized_account("norec@x.com", "pw", "cid", "rt", authorization_type="graph")
+            row = web_outlook_app.get_db().execute(
+                "SELECT recovery_email, recovery_email_password FROM accounts WHERE email = ?",
+                ("norec@x.com",),
+            ).fetchone()
+            self.assertEqual(row["recovery_email"], "")
+            # 不传 recovery 时密码留空(空字符串,build_account_insert_values 对 falsy 不加密)
+            self.assertEqual(row["recovery_email_password"], "")
+
+    def test_extract_graph_refresh_token_accepts_bind_secondary_kwarg(self):
+        """签名向后兼容:bind_secondary 默认 None/False 不改变原 Skip 行为。"""
+        import inspect
+        sig = inspect.signature(web_outlook_app.extract_graph_refresh_token)
+        self.assertIn("bind_secondary", sig.parameters)
+        # 默认应为 falsy(None 或 False)
+        self.assertFalse(sig.parameters["bind_secondary"].default)
+
+    @patch("web_outlook_app.bind_proof_in_session")
+    @patch("web_outlook_app.create_or_get_address")
+    def test_proofs_add_branch_calls_bind_when_bind_secondary_truthy(self, mock_create, mock_bind):
+        """到达 proofs/Add 且 bind_secondary=True 时调用 create_or_get_address + bind_proof_in_session。"""
+        import types as _types
+
+        # 1) 授权页:含 sFTTag(flow token) + urlPost,让函数通过 flow_token 提取
+        auth_html = (
+            '<html><head>'
+            'sFTTag:"<input type=\\"hidden\\" name=\\"PPFT\\" value=\\"FTOKEN\\"/>"'
+            '</head><body>'
+            '<script>var sCtx="CTX";</script>'
+            '<script>var urlPost="https://login.live.com/ppsecure/post.srf";</script>'
+            '</body></html>'
+        )
+        auth_resp = _types.SimpleNamespace(
+            status_code=200, text=auth_html,
+            url="https://login.live.com/oauth20_authorize.srf", headers={},
+        )
+
+        # 2) proofs/Add 页面(带 form)
+        add_html = '<form action="/proofs/Add?canary=C" method="post"><input name="canary" value="C"/></form>'
+        add_resp = _types.SimpleNamespace(
+            status_code=200, text=add_html,
+            url="https://account.live.com/proofs/Add", headers={},
+        )
+
+        # 3) 登录 POST 返回 302 → 重定向到 proofs/Add
+        login_redirect = _types.SimpleNamespace(
+            status_code=302,
+            headers={"Location": "https://account.live.com/proofs/Add"},
+            url="https://login.live.com/ppsecure/post.srf",
+            text="",
+        )
+
+        # 4) bind 返回 302 → localhost with code
+        bound_resp = _types.SimpleNamespace(
+            status_code=302,
+            headers={"Location": "http://localhost/?code=THECODE"},
+            url="http://localhost/?code=THECODE",
+            text="",
+        )
+
+        mock_bind.return_value = bound_resp
+        mock_create.return_value = {"address": "ms-foo@cf.com", "jwt": "j", "password": "auxpw", "use_admin": False}
+
+        # session.get: 首次(授权页)返回 auth_resp;之后(重定向跟随)返回 add_resp
+        get_responses = [auth_resp, add_resp]
+
+        class FakeSession:
+            def __init__(self):
+                self.headers = {}
+                self.proxies = {}
+                self.trust_env = False
+                self._get_calls = 0
+
+            def get(self, *a, **k):
+                idx = self._get_calls
+                self._get_calls += 1
+                if idx == 0:
+                    return auth_resp
+                return add_resp
+
+            def post(self, *a, **k):
+                url = (a[0] if a else k.get('url', '')) or ''
+                # token 端点 → JSON 响应
+                if "token" in url:
+                    return _types.SimpleNamespace(
+                        status_code=200, headers={}, text="",
+                        json=lambda: {"access_token": "at", "refresh_token": "rt"},
+                    )
+                # 登录 POST(login.live.com)→ 302 到 proofs/Add;其它 POST → bound_resp
+                if "login.live.com" in url or "ppsecure" in url:
+                    return login_redirect
+                return bound_resp
+
+        fake = FakeSession()
+        result = web_outlook_app.extract_graph_refresh_token(
+            "foo@outlook.com", "pw", bind_secondary=True,
+            session_factory=lambda: fake,
+        )
+        # 断言 bind 被调用(create_or_get_address 至少一次,bind_proof_in_session 至少一次)
+        self.assertTrue(mock_create.called, "bind_secondary=True 时应调用 create_or_get_address")
+        self.assertTrue(mock_bind.called, "bind_secondary=True 且到 proofs/Add 时应调用 bind_proof_in_session")
+
+
 if __name__ == '__main__':
     unittest.main()
