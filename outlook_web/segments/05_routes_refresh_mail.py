@@ -1077,16 +1077,16 @@ def refresh_accounts_parallel(accounts, *, refresh_fn, max_workers, progress_cal
             try:
                 result = future.result()
             except Exception as exc:
-                result = {'success': False, 'email': account.get('email', ''), 'error': str(exc)}
+                result = {'success': False, 'email': account['email'], 'error': str(exc)}
             results.append(result)
             if progress_callback:
                 progress_callback({
                     'type': 'progress',
                     'index': completed_index,
                     'total': total,
-                    'email': account.get('email', ''),
+                    'email': account['email'],
                     'success': bool(result.get('success')),
-                    'error': result.get('error', '') if not result.get('success') else '',
+                    'error': (result.get('error', '') or result.get('error_message', '')) if not result.get('success') else '',
                 })
             if stop_check():
                 for f in future_map:

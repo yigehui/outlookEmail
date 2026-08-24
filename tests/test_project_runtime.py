@@ -3488,6 +3488,43 @@ class RefreshParallelDispatchTests(unittest.TestCase):
         self.assertEqual(len(failed), 1)
         self.assertIn('boom', failed[0].get('error', ''))
 
+    def test_parallel_handles_sqlite3_row_accounts(self):
+        # sqlite3.Row has no .get() — helper must use subscript access (regression guard).
+        # progress_callback must be non-None so the email-extraction path actually runs.
+        import sqlite3
+        conn = sqlite3.connect(':memory:')
+        conn.row_factory = sqlite3.Row
+        conn.execute('CREATE TABLE a(id INTEGER, email TEXT)')
+        conn.executemany('INSERT INTO a VALUES (?,?)', [(i, f'u{i}@x.com') for i in range(3)])
+        rows = conn.execute('SELECT id, email FROM a').fetchall()
+        events = []
+        def fake_refresh(account, log_type, db_conn=None):
+            return {'success': True, 'email': account['email']}
+        results = web_outlook_app.refresh_accounts_parallel(
+            rows, refresh_fn=fake_refresh, max_workers=2,
+            progress_callback=events.append, stop_check=lambda: False,
+            db_conn=None, log_refresh_type='manual',
+        )
+        self.assertEqual(len(results), 3)
+        self.assertTrue(all(r['success'] for r in results))
+        # progress events fired and each carries the row's email (subscript access works)
+        self.assertEqual(len(events), 3)
+        self.assertEqual({e['email'] for e in events}, {f'u{i}@x.com' for i in range(3)})
+
+    def test_parallel_progress_error_uses_error_message_key(self):
+        events = []
+        def fake_refresh(account, log_type, db_conn=None):
+            return {'success': False, 'error_message': 'Token 刷新失败'}
+        accounts = [{'id': 1, 'email': 'u@x.com'}]
+        web_outlook_app.refresh_accounts_parallel(
+            accounts, refresh_fn=fake_refresh, max_workers=1,
+            progress_callback=events.append, stop_check=lambda: False,
+            db_conn=None, log_refresh_type='manual',
+        )
+        self.assertEqual(len(events), 1)
+        self.assertFalse(events[0]['success'])
+        self.assertEqual(events[0]['error'], 'Token 刷新失败')
+
 
 if __name__ == '__main__':
     unittest.main()
