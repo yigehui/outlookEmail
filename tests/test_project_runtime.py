@@ -3411,5 +3411,83 @@ class RefreshParallelSettingsTests(unittest.TestCase):
         self.assertEqual(val, '20')
 
 
+class RefreshParallelDispatchTests(unittest.TestCase):
+    # Pure-function concurrency tests — no DB, no app context, no setUp needed.
+
+    def test_parallel_runs_all_accounts_and_counts_correctly(self):
+        calls = []
+        def fake_refresh(account, log_type, db_conn=None):
+            calls.append(account['email'])
+            return {'success': True, 'email': account['email']}
+        accounts = [{'id': i, 'email': f'u{i}@x.com'} for i in range(7)]
+        results = web_outlook_app.refresh_accounts_parallel(
+            accounts,
+            refresh_fn=fake_refresh,
+            max_workers=5,
+            progress_callback=None,
+            stop_check=lambda: False,
+            db_conn=None,
+            log_refresh_type='manual',
+        )
+        self.assertEqual(len(results), 7)
+        self.assertEqual(set(calls), {a['email'] for a in accounts})
+        self.assertTrue(all(r['success'] for r in results))
+
+    def test_parallel_progress_callback_fires_per_account(self):
+        events = []
+        def fake_refresh(account, log_type, db_conn=None):
+            return {'success': True, 'email': account['email']}
+        accounts = [{'id': i, 'email': f'u{i}@x.com'} for i in range(4)]
+        web_outlook_app.refresh_accounts_parallel(
+            accounts,
+            refresh_fn=fake_refresh,
+            max_workers=2,
+            progress_callback=events.append,
+            stop_check=lambda: False,
+            db_conn=None,
+            log_refresh_type='manual',
+        )
+        # 4 accounts → 4 progress events, each with type/index/total/email/success
+        self.assertEqual(len(events), 4)
+        self.assertTrue(all(e['type'] == 'progress' for e in events))
+        self.assertEqual({e['total'] for e in events}, {4})
+        self.assertEqual({e['index'] for e in events}, {1, 2, 3, 4})
+        self.assertTrue(all(e['success'] is True for e in events))
+
+    def test_parallel_stop_request_cancels_remaining(self):
+        submitted = []
+        def fake_refresh(account, log_type, db_conn=None):
+            submitted.append(account['email'])
+            return {'success': True, 'email': account['email']}
+        counter = {'n': 0}
+        def stop_check():
+            counter['n'] += 1
+            return counter['n'] > 3
+        accounts = [{'id': i, 'email': f'u{i}@x.com'} for i in range(20)]
+        results = web_outlook_app.refresh_accounts_parallel(
+            accounts, refresh_fn=fake_refresh, max_workers=2,
+            progress_callback=None, stop_check=stop_check,
+            db_conn=None, log_refresh_type='manual',
+        )
+        # stop_check returns True after the 3rd submit → submit loop breaks early
+        self.assertLess(len(submitted), 20)
+
+    def test_parallel_exception_in_refresh_becomes_failed_result(self):
+        def fake_refresh(account, log_type, db_conn=None):
+            if account['id'] == 1:
+                raise RuntimeError('boom')
+            return {'success': True, 'email': account['email']}
+        accounts = [{'id': i, 'email': f'u{i}@x.com'} for i in range(3)]
+        results = web_outlook_app.refresh_accounts_parallel(
+            accounts, refresh_fn=fake_refresh, max_workers=2,
+            progress_callback=None, stop_check=lambda: False,
+            db_conn=None, log_refresh_type='manual',
+        )
+        self.assertEqual(len(results), 3)
+        failed = [r for r in results if not r.get('success')]
+        self.assertEqual(len(failed), 1)
+        self.assertIn('boom', failed[0].get('error', ''))
+
+
 if __name__ == '__main__':
     unittest.main()

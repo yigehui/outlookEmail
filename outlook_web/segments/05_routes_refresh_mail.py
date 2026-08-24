@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 import secrets
 import threading
 import time
@@ -1046,6 +1046,53 @@ def get_refresh_execution_mode(db_conn) -> str:
         "SELECT value FROM settings WHERE key = 'refresh_execution_mode'"
     ).fetchone()
     return normalize_refresh_execution_mode(row['value'] if row and row['value'] is not None else None)
+
+
+def refresh_accounts_parallel(accounts, *, refresh_fn, max_workers, progress_callback,
+                              stop_check, db_conn, log_refresh_type):
+    """并行执行单账号刷新，逐 future 回调进度，保持进度事件形态与串行一致。
+
+    stop_check 返回 True 时停止提交剩余账号；已提交的 future 仍等其完成
+    （正在运行的让其结束，尚未开始的尝试取消）。db_conn 透传给 refresh_fn，
+    由调用方决定连接的线程安全策略（本函数不做连接管理）。
+    """
+    if not accounts:
+        return []
+    effective_workers = min(max(1, max_workers), len(accounts))
+    results = []
+    total = len(accounts)
+    completed_index = 0
+
+    with ThreadPoolExecutor(max_workers=effective_workers, thread_name_prefix='refresh-account') as executor:
+        future_map = {}
+        for account in accounts:
+            if stop_check():
+                break
+            future = executor.submit(refresh_fn, account, log_refresh_type, db_conn=db_conn)
+            future_map[future] = account
+
+        for future in as_completed(future_map):
+            account = future_map[future]
+            completed_index += 1
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {'success': False, 'email': account.get('email', ''), 'error': str(exc)}
+            results.append(result)
+            if progress_callback:
+                progress_callback({
+                    'type': 'progress',
+                    'index': completed_index,
+                    'total': total,
+                    'email': account.get('email', ''),
+                    'success': bool(result.get('success')),
+                    'error': result.get('error', '') if not result.get('success') else '',
+                })
+            if stop_check():
+                for f in future_map:
+                    f.cancel()
+                break
+    return results
 
 
 def run_full_refresh(snapshot_trigger_type: str, log_refresh_type: str,
