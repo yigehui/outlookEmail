@@ -3837,5 +3837,124 @@ class RefreshModeDispatchTests(unittest.TestCase):
         self.assertNotIn('complete', types)
 
 
+class CloudflareMailTests(unittest.TestCase):
+    """12_cloudflare_mail.py 纯单元测试:mock requests,不打真实网络。"""
+
+    def setUp(self):
+        # 注入 CF 配置经环境变量(源模块读 os.environ),不依赖 DB settings。
+        # 纯单元测试无 app context,故把 DB 回退 get_setting 也 mock 掉,避免触库。
+        self._env_patch = patch.dict("web_outlook_app.os.environ", {
+            "CF_MAIL_BASE": "https://mail.example.com",
+            "CF_MAIL_ADMIN": "adminpw",
+            "CF_MAIL_DOMAIN": "example.com",
+            "CF_MAIL_SITE_PASS": "",
+        }, clear=False)
+        self._env_patch.start()
+        self.addCleanup(self._env_patch.stop)
+        # get_setting 是 DB 回退(环境变量优先时不会被用到),mock 成空串避免触库/需 app context
+        self._gs_patch = patch("web_outlook_app.get_setting", return_value='')
+        self._gs_patch.start()
+        self.addCleanup(self._gs_patch.stop)
+        # 直连,不走代理
+        web_outlook_app.set_proxy(None)
+
+    def _make_session_mock(self, post_resp=None, get_resp=None):
+        """构造一个假 requests.Session:_cf_session() 会调 requests.Session() 拿到它。"""
+        sess = types.SimpleNamespace()
+        sess.headers = {}
+        sess.proxies = {}
+        sess.trust_env = False
+        sess.post = lambda *a, **k: post_resp
+        sess.get = lambda *a, **k: get_resp
+        return sess
+
+    @patch("web_outlook_app.requests.Session")
+    def test_create_or_get_address_returns_address(self, mock_session_cls):
+        resp = types.SimpleNamespace()
+        resp.status_code = 200
+        resp.json = lambda: {"jwt": "j", "address": "msjosephfoo@example.com",
+                             "address_id": 1, "password": None}
+        resp.text = "{}"
+        mock_session_cls.return_value = self._make_session_mock(post_resp=resp)
+        result = web_outlook_app.create_or_get_address("joseph_foo@outlook.com")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["jwt"], "j")
+        self.assertEqual(result["address"], "msjosephfoo@example.com")
+        self.assertFalse(result["use_admin"])
+        self.assertEqual(result["address_id"], 1)
+
+    @patch("web_outlook_app.requests.Session")
+    def test_create_or_get_address_existing_falls_back_to_admin(self, mock_session_cls):
+        # 第一次 post 返回 400(已存在);之后 _find_address_id 调 get 返回空 -> None -> 跳过重设密码
+        post_resp = types.SimpleNamespace(
+            status_code=400, text="address already exists", json=lambda: {}
+        )
+        get_resp = types.SimpleNamespace(
+            status_code=200, json=lambda: {"results": []}, text="{}"
+        )
+        mock_session_cls.return_value = self._make_session_mock(
+            post_resp=post_resp, get_resp=get_resp
+        )
+        result = web_outlook_app.create_or_get_address("joseph_foo@outlook.com")
+        self.assertTrue(result["use_admin"])
+        self.assertEqual(result["jwt"], None)
+        self.assertEqual(result["address"], "msjosephfoo@example.com")
+        self.assertIsNone(result["password"])
+
+    def test_extract_code_finds_six_digit(self):
+        self.assertEqual(web_outlook_app.extract_code("Your security code is 123456"), "123456")
+        self.assertEqual(web_outlook_app.extract_code("验证码:987654"), "987654")
+        self.assertEqual(web_outlook_app.extract_code("code: 111111"), "111111")
+
+    def test_extract_code_returns_none_when_absent(self):
+        self.assertIsNone(web_outlook_app.extract_code("no code here"))
+        self.assertIsNone(web_outlook_app.extract_code(""))
+
+    def test_build_address_name_and_ms_prefix(self):
+        self.assertEqual(web_outlook_app.ms_prefix("Joseph_Lee239@outlook.com"), "joseph_lee239")
+        self.assertEqual(
+            web_outlook_app.build_address_name("Joseph_Lee239@outlook.com"),
+            "ms-joseph_lee239",
+        )
+
+    @patch("web_outlook_app.requests.Session")
+    def test_fetch_parsed_mails_returns_results(self, mock_session_cls):
+        resp = types.SimpleNamespace(status_code=200, text="{}")
+        resp.json = lambda: {"results": [{"id": 1, "subject": "code: 111111", "text": ""}]}
+        mock_session_cls.return_value = self._make_session_mock(get_resp=resp)
+        mails = web_outlook_app.fetch_parsed_mails("jwt-token")
+        self.assertEqual(len(mails), 1)
+        self.assertEqual(mails[0]["id"], 1)
+
+    def test_extract_code_prefers_labeled_code_over_bare_number(self):
+        # "code is 123456" 应优先于正文里其他 6 位数
+        self.assertEqual(
+            web_outlook_app.extract_code("Your code is 123456. Ref 000000."),
+            "123456",
+        )
+
+    @patch("web_outlook_app.requests.Session")
+    def test_fetch_admin_mails_returns_results(self, mock_session_cls):
+        resp = types.SimpleNamespace(status_code=200, text="{}")
+        resp.json = lambda: {"results": [{"id": 9, "raw": "Subject: hi\r\n\r\nbody"}]}
+        mock_session_cls.return_value = self._make_session_mock(get_resp=resp)
+        raws = web_outlook_app.fetch_admin_mails("msjosephfoo@example.com")
+        self.assertEqual(len(raws), 1)
+        self.assertEqual(raws[0]["id"], 9)
+
+    def test_parse_admin_mail_extracts_subject_and_body(self):
+        # parse_admin_mail 是纯函数,不碰网络
+        raw = ("From: someone@x.com\r\n"
+               "Subject: =?utf-8?b?...?= verify\r\n"
+               "Content-Type: text/plain; charset=utf-8\r\n"
+               "Content-Transfer-Encoding: 7bit\r\n\r\n"
+               "Your code is 654321.\r\n")
+        parsed = web_outlook_app.parse_admin_mail({"id": 5, "raw": raw})
+        self.assertEqual(parsed["id"], 5)
+        self.assertIn("verify", parsed["subject"])
+        self.assertIn("654321", parsed["text"])
+        self.assertEqual(parsed["sender"], "someone@x.com")
+
+
 if __name__ == '__main__':
     unittest.main()
