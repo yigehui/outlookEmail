@@ -319,6 +319,9 @@ class ProjectRuntimeTests(unittest.TestCase):
         with self.app.app_context():
             db = web_outlook_app.get_db()
             db.execute("UPDATE settings SET value = '0' WHERE key = 'refresh_delay_seconds'")
+            # 本用例断言串行路径的逐账号 SSE 事件（account_id、test_refresh_token
+            # 调用计数），固定为 serial 避免落入默认 parallel 分支。
+            db.execute("UPDATE settings SET value = 'serial' WHERE key = 'refresh_execution_mode'")
             db.commit()
 
         task_response = self.client.post('/api/accounts/refresh-selected-stream', json={
@@ -3371,6 +3374,12 @@ class RefreshParallelSettingsTests(unittest.TestCase):
 
     def test_default_parallel_workers_is_5(self):
         with self.app.app_context():
+            db = web_outlook_app.get_db()
+            # 清掉这两个 setting 行，让 init_db 的 INSERT OR IGNORE 真正去 seed，
+            # 否则其他用例（如 RefreshTokenProxyFallbackTests 固定 serial）会留下
+            # 污染值，使本用例测不到 init_db 的默认播种行为。
+            db.execute("DELETE FROM settings WHERE key IN ('refresh_parallel_workers', 'refresh_execution_mode')")
+            db.commit()
             web_outlook_app.init_db()
             db = web_outlook_app.get_db()
             workers_row = db.execute(
@@ -3524,6 +3533,130 @@ class RefreshParallelDispatchTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertFalse(events[0]['success'])
         self.assertEqual(events[0]['error'], 'Token 刷新失败')
+
+
+class RefreshModeDispatchTests(unittest.TestCase):
+    """run_full_refresh 在 parallel 模式下走 refresh_accounts_parallel 分支；
+
+    worker (_refresh_account_in_thread) 自建 sqlite 连接，不共享主连接。
+    """
+
+    def setUp(self):
+        self.app = web_outlook_app.app
+        self.app.config['TESTING'] = True
+        self.app.config['WTF_CSRF_ENABLED'] = False
+        self.client = self.app.test_client()
+        with self.app.app_context():
+            web_outlook_app.init_db()
+            web_outlook_app.set_setting(
+                web_outlook_app.LOGIN_SESSION_VERSION_SETTING_KEY,
+                web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION,
+            )
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM accounts')
+            web_outlook_app.set_setting('login_password', web_outlook_app.hash_password('export-pass'))
+            db.commit()
+        with self.client.session_transaction() as sess:
+            sess['logged_in'] = True
+            sess['login_session_version'] = web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION
+
+    def _insert_two_active_accounts(self):
+        with self.app.app_context():
+            web_outlook_app.add_account('a@x.com', 'pw', 'cid', 'rt', group_id=1)
+            web_outlook_app.add_account('b@x.com', 'pw', 'cid', 'rt', group_id=1)
+            db = web_outlook_app.get_db()
+            db.commit()
+
+    def test_run_full_refresh_uses_parallel_when_configured(self):
+        self._insert_two_active_accounts()
+        with self.app.app_context():
+            web_outlook_app.set_setting('refresh_execution_mode', 'parallel')
+            web_outlook_app.set_setting('refresh_parallel_workers', '3')
+            web_outlook_app.get_db().commit()
+
+        with patch.object(
+            web_outlook_app,
+            'refresh_accounts_parallel',
+            return_value=[
+                {'success': True, 'email': 'a@x.com'},
+                {'success': True, 'email': 'b@x.com'},
+            ],
+        ) as mock_parallel:
+            result = web_outlook_app.run_full_refresh('manual_all', 'manual', progress_callback=None)
+
+        self.assertTrue(mock_parallel.called)
+        args, kwargs = mock_parallel.call_args
+        # worker 必须是自建连接的 _refresh_account_in_thread（线程安全回归守卫）
+        self.assertIs(kwargs.get('refresh_fn'), web_outlook_app._refresh_account_in_thread)
+        self.assertEqual(kwargs.get('max_workers'), 3)
+        self.assertEqual(result['success_count'], 2)
+        self.assertEqual(result['failed_count'], 0)
+        self.assertEqual(result['total'], 2)
+
+    def test_run_full_refresh_serial_mode_not_called(self):
+        with self.app.app_context():
+            web_outlook_app.add_account('s@x.com', 'pw', 'cid', 'rt', group_id=1)
+            web_outlook_app.set_setting('refresh_execution_mode', 'serial')
+            web_outlook_app.get_db().commit()
+
+        with patch.object(web_outlook_app, 'refresh_accounts_parallel') as mock_parallel, \
+             patch.object(
+                 web_outlook_app,
+                 'refresh_outlook_account_token',
+                 return_value={'success': True, 'message': 'ok'},
+             ):
+            result = web_outlook_app.run_full_refresh('manual_all', 'manual', progress_callback=None)
+
+        self.assertFalse(mock_parallel.called)
+        self.assertEqual(result['success_count'], 1)
+
+    def test_run_full_refresh_parallel_counts_failures(self):
+        self._insert_two_active_accounts()
+        with self.app.app_context():
+            web_outlook_app.set_setting('refresh_execution_mode', 'parallel')
+            web_outlook_app.get_db().commit()
+
+        with patch.object(
+            web_outlook_app,
+            'refresh_accounts_parallel',
+            return_value=[
+                {'success': True, 'email': 'a@x.com'},
+                {'success': False, 'email': 'b@x.com', 'error': 'boom'},
+            ],
+        ):
+            result = web_outlook_app.run_full_refresh('manual_all', 'manual', progress_callback=None)
+
+        self.assertEqual(result['success_count'], 1)
+        self.assertEqual(result['failed_count'], 1)
+        failed_list = result['failed_list']
+        self.assertEqual(len(failed_list), 1)
+        self.assertIn('boom', failed_list[0].get('error', ''))
+
+    def test_refresh_account_in_thread_uses_own_connection(self):
+        import sqlite3
+        with self.app.app_context():
+            web_outlook_app.add_account('x@x.com', 'pw', 'cid', 'rt', group_id=1)
+            account = web_outlook_app.get_account_by_email('x@x.com')
+            account_dict = {
+                'id': account['id'],
+                'email': account['email'],
+                'client_id': account['client_id'],
+                'refresh_token': account['refresh_token'],
+            }
+            web_outlook_app.get_db().commit()
+
+        with patch.object(
+            web_outlook_app,
+            'refresh_outlook_account_token',
+            return_value={'success': True, 'message': 'ok'},
+        ) as mock_refresh:
+            result = web_outlook_app._refresh_account_in_thread(account_dict, 'manual')
+
+        self.assertTrue(result.get('success'))
+        args, kwargs = mock_refresh.call_args
+        # worker 自建独立 sqlite 连接传给 refresh_outlook_account_token（线程安全回归守卫）
+        self.assertIsNotNone(kwargs.get('db_conn'))
+        self.assertIsInstance(kwargs['db_conn'], sqlite3.Connection)
 
 
 if __name__ == '__main__':

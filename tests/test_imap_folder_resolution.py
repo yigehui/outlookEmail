@@ -2204,6 +2204,10 @@ class RefreshTokenProxyFallbackTests(unittest.TestCase):
             db.execute('DELETE FROM account_refresh_logs')
             db.execute('DELETE FROM accounts')
             db.execute("DELETE FROM groups WHERE name NOT IN ('默认分组', '临时邮箱')")
+            # 本类验证串行刷新路径（中途停止、异常冒泡、delay 事件、账号级 SSE），
+            # 固定 serial 避免落入默认 parallel 分支（其 SSE account_id 为 null、
+            # 停止语义不同、异常被 worker 吞为失败结果）。
+            db.execute("UPDATE settings SET value = 'serial' WHERE key = 'refresh_execution_mode'")
             db.commit()
 
             group_id = web_outlook_app.add_group(
