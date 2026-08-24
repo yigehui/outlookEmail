@@ -3956,5 +3956,65 @@ class CloudflareMailTests(unittest.TestCase):
         self.assertEqual(parsed["sender"], "someone@x.com")
 
 
+class BindProofTests(unittest.TestCase):
+    """13_oauth_bind.py: proofs/Add 与 proofs/Verify 表单解析器(纯正则,无网络无 DB)。"""
+
+    def test_parse_proof_add_form_extracts_action_and_hidden_inputs(self):
+        html = '''
+        <form action="/proofs/Add?canary=ABC" method="post">
+          <input type="hidden" name="canary" value="ABC"/>
+          <input type="hidden" name="hid" value="X"/>
+        </form>'''
+        action, data = web_outlook_app._parse_proof_add_form(html, "https://account.live.com/proofs/Add")
+        self.assertIsNotNone(action)
+        self.assertTrue(action.startswith("https://account.live.com"))
+        self.assertIn("canary", action)
+        self.assertEqual(data.get("canary"), "ABC")
+        self.assertEqual(data.get("hid"), "X")
+
+    def test_parse_proof_add_form_returns_none_when_no_form(self):
+        action, data = web_outlook_app._parse_proof_add_form("no form here", "https://x/proofs/Add")
+        self.assertIsNone(action)
+        self.assertIsNone(data)
+
+    def test_parse_proof_verify_form_extracts_frmVerifyProof_action(self):
+        html = '''
+        <form id="frmVerifyProof" action="/proofs/Verify?epid=ZZ" method="post">
+          <input type="hidden" name="canary" value="C"/>
+          <input type="hidden" name="action" value="VerifyProof"/>
+        </form>'''
+        action, data = web_outlook_app._parse_proof_verify_form(html, "https://account.live.com/proofs/Verify")
+        self.assertIsNotNone(action)
+        self.assertIn("epid", action)
+        self.assertEqual(data.get("canary"), "C")
+
+    def test_parse_proof_verify_form_fallback_action_when_no_frmVerifyProof(self):
+        # 无 id/name=frmVerifyProof,但 action 含 proofs/Verify -> 退化匹配
+        html = '''
+        <form action="/proofs/Verify?epid=QQ" method="post">
+          <input type="hidden" name="canary" value="D"/>
+        </form>'''
+        action, data = web_outlook_app._parse_proof_verify_form(html, "https://account.live.com/proofs/Verify")
+        self.assertIsNotNone(action)
+        self.assertIn("epid", action)
+        self.assertEqual(data.get("canary"), "D")
+
+    def test_parse_proof_verify_form_returns_none_when_no_verify_form(self):
+        html = '<form action="/other" method="post"><input name="x" value="y"/></form>'
+        action, data = web_outlook_app._parse_proof_verify_form(html, "https://account.live.com/other")
+        self.assertIsNone(action)
+
+    def test_bind_proof_in_session_callable(self):
+        # 仅断言函数已注册为裸名 + 签名兼容(不跑真实 session,避免重 mock HTTP 链)
+        self.assertTrue(callable(web_outlook_app.bind_proof_in_session))
+        import inspect
+        sig = inspect.signature(web_outlook_app.bind_proof_in_session)
+        params = set(sig.parameters)
+        for required in ("session", "html", "url", "cf_address"):
+            self.assertIn(required, params)
+        # cm_module 保留以兼容旧签名
+        self.assertIn("cm_module", params)
+
+
 if __name__ == '__main__':
     unittest.main()
