@@ -2302,6 +2302,124 @@ class RecoveryEmailTests(unittest.TestCase):
             return int(cursor.lastrowid)
 
 
+class ExternalImportApiTests(unittest.TestCase):
+    """对外 API /api/external/accounts/import：API Key 鉴权 + 复用主账号导入管道。"""
+
+    def setUp(self):
+        self.app = web_outlook_app.app
+        self.app.config['TESTING'] = True
+        self.app.config['WTF_CSRF_ENABLED'] = False
+        self.client = self.app.test_client()
+
+        with self.app.app_context():
+            web_outlook_app.init_db()
+            web_outlook_app.set_setting(
+                web_outlook_app.LOGIN_SESSION_VERSION_SETTING_KEY,
+                web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION,
+            )
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM accounts')
+            web_outlook_app.set_setting('login_password', web_outlook_app.hash_password('export-pass'))
+            # 配置对外 API Key
+            web_outlook_app.set_setting('external_api_key', 'sk-test-123')
+            db.commit()
+
+        with self.client.session_transaction() as sess:
+            sess['logged_in'] = True
+            sess['login_session_version'] = web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION
+
+    def _headers(self):
+        return {'X-API-Key': 'sk-test-123'}
+
+    def test_import_with_valid_api_key_writes_main_table(self):
+        response = self.client.post(
+            '/api/external/accounts/import',
+            headers=self._headers(),
+            json={
+                'account_string': 'imp1@x.com----pw1----clientid1----reftoken1----aux1@cf.com----auxpw1',
+                'group_id': 1,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data['success'])
+        self.assertEqual(data['added_count'], 1)
+
+        with self.app.app_context():
+            row = web_outlook_app.get_db().execute(
+                'SELECT email, recovery_email FROM accounts WHERE email = ?',
+                ('imp1@x.com',),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row['email'], 'imp1@x.com')
+        self.assertEqual(row['recovery_email'], 'aux1@cf.com')
+
+    def test_import_without_api_key_rejected(self):
+        response = self.client.post(
+            '/api/external/accounts/import',
+            json={'account_string': 'x@x.com----pw----cid----rt'},
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertFalse(response.get_json()['success'])
+
+    def test_import_invalid_key_rejected(self):
+        response = self.client.post(
+            '/api/external/accounts/import',
+            headers={'X-API-Key': 'wrong'},
+            json={'account_string': 'x@x.com----pw----cid----rt'},
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertFalse(response.get_json()['success'])
+
+    def test_import_4_segment_backward_compatible(self):
+        response = self.client.post(
+            '/api/external/accounts/import',
+            headers=self._headers(),
+            json={'account_string': 'imp2@x.com----pw2----cid2----rt2'},
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data['success'])
+        self.assertEqual(data['added_count'], 1)
+
+        with self.app.app_context():
+            row = web_outlook_app.get_db().execute(
+                'SELECT recovery_email FROM accounts WHERE email = ?',
+                ('imp2@x.com',),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row['recovery_email'], '')
+
+    def test_import_multi_line_bulk(self):
+        response = self.client.post(
+            '/api/external/accounts/import',
+            headers=self._headers(),
+            json={
+                'account_string': 'a@x.com----p----c----r\nb@x.com----p----c----r',
+                'group_id': 1,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data['success'])
+        self.assertEqual(data['added_count'], 2)
+
+    def test_import_returns_skipped_and_invalid_counts(self):
+        # 第一行导入成功，第二行重复被跳过，第三行无 ---- 分隔符为无效行
+        account_string = 'a@x.com----p----c----r\na@x.com----p----c----r\nNOT_AN_ACCOUNT'
+        response = self.client.post(
+            '/api/external/accounts/import',
+            headers=self._headers(),
+            json={'account_string': account_string},
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data['success'])
+        self.assertEqual(data['added_count'], 1)
+        self.assertEqual(data['skipped_count'], 1)
+        self.assertEqual(data['invalid_count'], 1)
+
+
 class FrontendColorPickerTests(unittest.TestCase):
     def test_color_picker_initialization_block_calls_init_once(self):
         core_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '01-core.js').read_text(encoding='utf-8')
