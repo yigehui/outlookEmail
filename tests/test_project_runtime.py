@@ -3347,5 +3347,69 @@ class SchedulerTimezoneMigrationTests(unittest.TestCase):
         self.assertFalse(scheduler.started)
 
 
+class RefreshParallelSettingsTests(unittest.TestCase):
+    """刷新并发度 / 执行模式：DB seed、normalize 钳制、PUT /api/settings 写入。"""
+
+    def setUp(self):
+        self.app = web_outlook_app.app
+        self.app.config['TESTING'] = True
+        self.app.config['WTF_CSRF_ENABLED'] = False
+        self.client = self.app.test_client()
+        with self.app.app_context():
+            web_outlook_app.init_db()
+            web_outlook_app.set_setting(
+                web_outlook_app.LOGIN_SESSION_VERSION_SETTING_KEY,
+                web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION,
+            )
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM accounts')
+            web_outlook_app.set_setting('login_password', web_outlook_app.hash_password('export-pass'))
+            db.commit()
+        with self.client.session_transaction() as sess:
+            sess['logged_in'] = True
+            sess['login_session_version'] = web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION
+
+    def test_default_parallel_workers_is_5(self):
+        with self.app.app_context():
+            web_outlook_app.init_db()
+            db = web_outlook_app.get_db()
+            workers_row = db.execute(
+                "SELECT value FROM settings WHERE key = 'refresh_parallel_workers'"
+            ).fetchone()
+            mode_row = db.execute(
+                "SELECT value FROM settings WHERE key = 'refresh_execution_mode'"
+            ).fetchone()
+        self.assertIsNotNone(workers_row)
+        self.assertEqual(workers_row['value'], '5')
+        self.assertIsNotNone(mode_row)
+        self.assertEqual(mode_row['value'], 'parallel')
+
+    def test_normalize_parallel_workers_clamps_1_to_20(self):
+        self.assertEqual(web_outlook_app.normalize_refresh_parallel_workers('99'), 20)
+        self.assertEqual(web_outlook_app.normalize_refresh_parallel_workers('0'), 1)
+        self.assertEqual(web_outlook_app.normalize_refresh_parallel_workers('abc'), 5)
+        self.assertEqual(web_outlook_app.normalize_refresh_parallel_workers(None), 5)
+        self.assertEqual(web_outlook_app.normalize_refresh_parallel_workers('7'), 7)
+
+    def test_normalize_execution_mode_defaults_parallel(self):
+        self.assertEqual(web_outlook_app.normalize_refresh_execution_mode('serial'), 'serial')
+        self.assertEqual(web_outlook_app.normalize_refresh_execution_mode('parallel'), 'parallel')
+        self.assertEqual(web_outlook_app.normalize_refresh_execution_mode('bogus'), 'parallel')
+        self.assertEqual(web_outlook_app.normalize_refresh_execution_mode(None), 'parallel')
+
+    def test_settings_put_accepts_parallel_workers_and_clamps(self):
+        response = self.client.put(
+            '/api/settings',
+            json={'refresh_parallel_workers': '99'},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()['success'])
+        with self.app.app_context():
+            val = web_outlook_app.get_db().execute(
+                "SELECT value FROM settings WHERE key = 'refresh_parallel_workers'"
+            ).fetchone()['value']
+        self.assertEqual(val, '20')
+
+
 if __name__ == '__main__':
     unittest.main()

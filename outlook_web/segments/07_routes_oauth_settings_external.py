@@ -763,6 +763,28 @@ def api_update_settings():
         except ValueError:
             errors.append('刷新间隔必须是数字')
 
+    # 更新刷新并发度
+    if 'refresh_parallel_workers' in data:
+        try:
+            workers = int(data['refresh_parallel_workers'])
+            workers = max(1, min(20, workers))
+            if set_setting('refresh_parallel_workers', str(workers)):
+                updated.append('刷新并发度')
+            else:
+                errors.append('更新刷新并发度失败')
+        except (TypeError, ValueError):
+            errors.append('刷新并发度必须是数字')
+
+    # 更新刷新执行模式
+    if 'refresh_execution_mode' in data:
+        mode = str(data.get('refresh_execution_mode') or '').strip()
+        if mode not in ('serial', 'parallel'):
+            errors.append('刷新执行模式必须为 serial 或 parallel')
+        elif set_setting('refresh_execution_mode', mode):
+            updated.append('刷新执行模式')
+        else:
+            errors.append('更新刷新执行模式失败')
+
     # 更新 Cron 表达式
     if 'refresh_cron' in data:
         cron_expr = data['refresh_cron'].strip()

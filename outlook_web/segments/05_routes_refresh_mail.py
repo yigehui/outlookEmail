@@ -1015,6 +1015,39 @@ def get_refresh_delay_seconds(db_conn) -> int:
         return 5
 
 
+def normalize_refresh_parallel_workers(value) -> int:
+    """钳制刷新并发度到 1-20，默认 5。"""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return 5
+    return max(1, min(20, v))
+
+
+def get_refresh_parallel_workers(db_conn) -> int:
+    row = db_conn.execute(
+        "SELECT value FROM settings WHERE key = 'refresh_parallel_workers'"
+    ).fetchone()
+    if not row or row['value'] is None:
+        return 5
+    return normalize_refresh_parallel_workers(row['value'])
+
+
+REFRESH_EXECUTION_MODES = {'serial', 'parallel'}
+
+
+def normalize_refresh_execution_mode(value) -> str:
+    mode = str(value) if value is not None else 'parallel'
+    return mode if mode in REFRESH_EXECUTION_MODES else 'parallel'
+
+
+def get_refresh_execution_mode(db_conn) -> str:
+    row = db_conn.execute(
+        "SELECT value FROM settings WHERE key = 'refresh_execution_mode'"
+    ).fetchone()
+    return normalize_refresh_execution_mode(row['value'] if row and row['value'] is not None else None)
+
+
 def run_full_refresh(snapshot_trigger_type: str, log_refresh_type: str,
                      progress_callback=None, db_conn=None) -> Dict[str, Any]:
     lock_acquired = False
