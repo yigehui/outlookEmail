@@ -1082,6 +1082,7 @@ def refresh_accounts_parallel(accounts, *, refresh_fn, max_workers, progress_cal
             if progress_callback:
                 progress_callback({
                     'type': 'progress',
+                    'account_id': account['id'],
                     'index': completed_index,
                     'total': total,
                     'email': account['email'],
@@ -1106,9 +1107,9 @@ def _refresh_account_in_thread(account, log_refresh_type, db_conn=None):
     worker 线程里 get_db() 会失败），故 worker 必须把自建连接传入。
     """
     conn = sqlite3.connect(DATABASE)
-    conn.execute('PRAGMA foreign_keys = ON')
-    conn.row_factory = sqlite3.Row
     try:
+        conn.execute('PRAGMA foreign_keys = ON')
+        conn.row_factory = sqlite3.Row
         result = refresh_outlook_account_token(account, log_refresh_type, db_conn=conn)
         conn.commit()
         return result
@@ -1182,6 +1183,7 @@ def run_full_refresh(snapshot_trigger_type: str, log_refresh_type: str,
                         _seen['fail'] += 1
                     _real_cb({
                         'type': 'account_result',
+                        'account_id': payload.get('account_id'),
                         'current': payload.get('index'),
                         'total': payload.get('total'),
                         'email': payload.get('email', ''),
@@ -1213,6 +1215,20 @@ def run_full_refresh(snapshot_trigger_type: str, log_refresh_type: str,
                         'error': r.get('error') or r.get('error_message') or '未知错误',
                     })
             conn.commit()
+            # 停止时发 stopped 收尾（与串行路径一致），否则才发 complete 收尾。
+            if is_token_refresh_stop_requested():
+                stopped_payload = finalize_stopped_full_refresh(
+                    conn,
+                    snapshot_trigger_type,
+                    total,
+                    success_count,
+                    failed_count,
+                    failed_list,
+                    delay_seconds
+                )
+                if progress_callback:
+                    progress_callback(stopped_payload)
+                return stopped_payload
             # 复用既有的完成收尾逻辑
             error_summary = build_refresh_error_summary(failed_list)
             mark_token_refresh_snapshot_finished(
@@ -1401,8 +1417,9 @@ def stream_full_refresh_events(snapshot_trigger_type: str, log_refresh_type: str
 
         if get_refresh_execution_mode(conn) == 'parallel':
             # 并行模式：helper 阻塞执行，把进度事件收集后统一 yield（SSE 无法在
-            # 阻塞调用内边跑边 yield）。逐账号事件与串行路径同构（progress +
-            # account_result），account_id 取 None（helper 事件不携带）。
+            # 阻塞调用内边跑边 yield）。并行 progress 事件在账号完成后才触发，
+            # 语义上不再是“开始刷新”，故只发 account_result（携带 status/email/
+            # account_id/计数，前端据此更新行）。account_id 由 helper 透传。
             parallel_workers = get_refresh_parallel_workers(conn)
             collected = []
             refresh_accounts_parallel(
@@ -1424,9 +1441,12 @@ def stream_full_refresh_events(snapshot_trigger_type: str, log_refresh_type: str
                         'email': p.get('email', ''),
                         'error': p.get('error', '') or '未知错误',
                     })
-                yield f"data: {json.dumps({'type': 'progress', 'current': p['index'], 'total': p['total'], 'account_id': None, 'email': p['email'], 'success_count': success_count, 'failed_count': failed_count})}\n\n"
-                yield f"data: {json.dumps({'type': 'account_result', 'current': p['index'], 'total': p['total'], 'account_id': None, 'email': p['email'], 'status': 'success' if p.get('success') else 'failed', 'error_message': p.get('error', '') or '', 'success_count': success_count, 'failed_count': failed_count})}\n\n"
+                yield f"data: {json.dumps({'type': 'account_result', 'current': p['index'], 'total': p['total'], 'account_id': p.get('account_id'), 'email': p['email'], 'status': 'success' if p.get('success') else 'failed', 'error_message': p.get('error', '') or '', 'success_count': success_count, 'failed_count': failed_count})}\n\n"
             conn.commit()
+            # 停止时发 stopped 收尾（与串行路径一致），否则才发 complete 收尾。
+            if is_token_refresh_stop_requested():
+                yield f"data: {json.dumps(finalize_stopped_full_refresh(conn, snapshot_trigger_type, total, success_count, failed_count, failed_list, delay_seconds))}\n\n"
+                return
             error_summary = build_refresh_error_summary(failed_list)
             mark_token_refresh_snapshot_finished(
                 snapshot_trigger_type, total, success_count, failed_count, error_summary, conn
@@ -1568,8 +1588,9 @@ def stream_failed_refresh_events():
 
         if get_refresh_execution_mode(conn) == 'parallel':
             # 并行模式：helper 阻塞执行，把进度事件收集后统一 yield（SSE 无法在
-            # 阻塞调用内边跑边 yield）。逐账号事件与串行路径同构（progress +
-            # account_result），account_id 取 None。失败重试循环不维护 snapshot。
+            # 阻塞调用内边跑边 yield）。并行 progress 事件在账号完成后才触发，语义
+            # 上不再是“开始刷新”，故只发 account_result（携带 status/email/
+            # account_id/计数）。account_id 由 helper 透传。失败重试不维护 snapshot。
             parallel_workers = get_refresh_parallel_workers(conn)
             collected = []
             refresh_accounts_parallel(
@@ -1591,9 +1612,12 @@ def stream_failed_refresh_events():
                         'email': p.get('email', ''),
                         'error': p.get('error', '') or '未知错误',
                     })
-                yield f"data: {json.dumps({'type': 'progress', 'current': p['index'], 'total': p['total'], 'account_id': None, 'email': p['email'], 'success_count': success_count, 'failed_count': failed_count})}\n\n"
-                yield f"data: {json.dumps({'type': 'account_result', 'current': p['index'], 'total': p['total'], 'account_id': None, 'email': p['email'], 'status': 'success' if p.get('success') else 'failed', 'error_message': p.get('error', '') or '', 'success_count': success_count, 'failed_count': failed_count})}\n\n"
+                yield f"data: {json.dumps({'type': 'account_result', 'current': p['index'], 'total': p['total'], 'account_id': p.get('account_id'), 'email': p['email'], 'status': 'success' if p.get('success') else 'failed', 'error_message': p.get('error', '') or '', 'success_count': success_count, 'failed_count': failed_count})}\n\n"
             conn.commit()
+            # 停止时发 stopped 收尾（与串行路径一致），否则才发 complete 收尾。
+            if is_token_refresh_stop_requested():
+                yield f"data: {json.dumps(build_stopped_refresh_payload(total, success_count, failed_count, failed_list, delay_seconds=delay_seconds, refresh_type='retry_failed'))}\n\n"
+                return
             yield f"data: {json.dumps({'type': 'complete', 'total': total, 'success_count': success_count, 'failed_count': failed_count, 'failed_list': failed_list, 'delay_seconds': delay_seconds, 'refresh_type': 'retry_failed'})}\n\n"
             return
 
@@ -1777,8 +1801,9 @@ def stream_selected_refresh_events(account_ids: List[int]):
 
         if get_refresh_execution_mode(conn) == 'parallel':
             # 并行模式：helper 阻塞执行，把进度事件收集后统一 yield（SSE 无法在
-            # 阻塞调用内边跑边 yield）。逐账号事件与串行路径同构（progress +
-            # account_result），account_id 取 None。选中刷新不维护 snapshot。
+            # 阻塞调用内边跑边 yield）。并行 progress 事件在账号完成后才触发，语义
+            # 上不再是“开始刷新”，故只发 account_result（携带 status/email/
+            # account_id/计数）。account_id 由 helper 透传。选中刷新不维护 snapshot。
             parallel_workers = get_refresh_parallel_workers(conn)
             collected = []
             refresh_accounts_parallel(
@@ -1800,9 +1825,12 @@ def stream_selected_refresh_events(account_ids: List[int]):
                         'email': p.get('email', ''),
                         'error': p.get('error', '') or '未知错误',
                     })
-                yield f"data: {json.dumps({'type': 'progress', 'current': p['index'], 'total': p['total'], 'account_id': None, 'email': p['email'], 'success_count': success_count, 'failed_count': failed_count})}\n\n"
-                yield f"data: {json.dumps({'type': 'account_result', 'current': p['index'], 'total': p['total'], 'account_id': None, 'email': p['email'], 'status': 'success' if p.get('success') else 'failed', 'error_message': p.get('error', '') or '', 'success_count': success_count, 'failed_count': failed_count})}\n\n"
+                yield f"data: {json.dumps({'type': 'account_result', 'current': p['index'], 'total': p['total'], 'account_id': p.get('account_id'), 'email': p['email'], 'status': 'success' if p.get('success') else 'failed', 'error_message': p.get('error', '') or '', 'success_count': success_count, 'failed_count': failed_count})}\n\n"
             conn.commit()
+            # 停止时发 stopped 收尾（与串行路径一致），否则才发 complete 收尾。
+            if is_token_refresh_stop_requested():
+                yield f"data: {json.dumps(build_stopped_refresh_payload(total, success_count, failed_count, failed_list, delay_seconds=delay_seconds, refresh_type='manual_selected'))}\n\n"
+                return
             yield f"data: {json.dumps({'type': 'complete', 'total': total, 'success_count': success_count, 'failed_count': failed_count, 'failed_list': failed_list, 'delay_seconds': delay_seconds, 'refresh_type': 'manual_selected'})}\n\n"
             return
 

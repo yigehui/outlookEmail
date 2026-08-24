@@ -7,6 +7,7 @@ import tempfile
 import types
 import unittest
 import zipfile
+import json
 from email.message import EmailMessage
 from unittest.mock import call, patch
 
@@ -3657,6 +3658,65 @@ class RefreshModeDispatchTests(unittest.TestCase):
         # worker 自建独立 sqlite 连接传给 refresh_outlook_account_token（线程安全回归守卫）
         self.assertIsNotNone(kwargs.get('db_conn'))
         self.assertIsInstance(kwargs['db_conn'], sqlite3.Connection)
+
+    def test_helper_progress_event_carries_account_id(self):
+        events = []
+        def fake_refresh(account, log_type, db_conn=None):
+            return {'success': True, 'email': account['email']}
+        accounts = [{'id': 7, 'email': 'u7@x.com'}, {'id': 8, 'email': 'u8@x.com'}]
+        web_outlook_app.refresh_accounts_parallel(
+            accounts, refresh_fn=fake_refresh, max_workers=2,
+            progress_callback=events.append, stop_check=lambda: False,
+            db_conn=None, log_refresh_type='manual',
+        )
+        self.assertEqual(len(events), 2)
+        self.assertEqual({e['account_id'] for e in events}, {7, 8})
+
+    def test_run_full_refresh_parallel_stop_emits_stopped_payload(self):
+        self._insert_two_active_accounts()
+        with self.app.app_context():
+            web_outlook_app.set_setting('refresh_execution_mode', 'parallel')
+            web_outlook_app.get_db().commit()
+
+        with patch.object(
+            web_outlook_app,
+            'refresh_accounts_parallel',
+            return_value=[
+                {'success': True, 'email': 'a@x.com'},
+                {'success': False, 'email': 'b@x.com', 'error': 'boom'},
+            ],
+        ), patch.object(web_outlook_app, 'is_token_refresh_stop_requested', return_value=True):
+            result = web_outlook_app.run_full_refresh('manual_all', 'manual', progress_callback=None)
+
+        self.assertEqual(result['type'], 'stopped')
+        self.assertEqual(result['success_count'], 1)
+        self.assertEqual(result['failed_count'], 1)
+        self.assertEqual(result['processed_count'], 2)
+
+    def test_stream_full_parallel_stop_emits_stopped_event(self):
+        self._insert_two_active_accounts()
+        with self.app.app_context():
+            web_outlook_app.set_setting('refresh_execution_mode', 'parallel')
+            web_outlook_app.get_db().commit()
+
+        with patch.object(
+            web_outlook_app,
+            'refresh_accounts_parallel',
+            return_value=[
+                {'success': True, 'email': 'a@x.com'},
+                {'success': False, 'email': 'b@x.com', 'error': 'boom'},
+            ],
+        ), patch.object(web_outlook_app, 'is_token_refresh_stop_requested', return_value=True):
+            stream = web_outlook_app.stream_full_refresh_events('manual_all', 'manual')
+            try:
+                events = list(stream)
+            finally:
+                stream.close()
+
+        payloads = [json.loads(item.removeprefix('data: ').strip()) for item in events]
+        types = [p['type'] for p in payloads]
+        self.assertIn('stopped', types)
+        self.assertNotIn('complete', types)
 
 
 if __name__ == '__main__':
