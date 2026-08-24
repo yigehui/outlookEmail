@@ -8,7 +8,7 @@ import types
 import unittest
 import zipfile
 from email.message import EmailMessage
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 
 os.environ.setdefault('SECRET_KEY', 'test-secret-key')
@@ -3124,6 +3124,49 @@ class GraphTokenRetryTests(unittest.TestCase):
         response = web_outlook_app.request_graph_token_response("cid", "rt")
         self.assertEqual(response.status_code, 429)
         self.assertEqual(mock_post.call_count, 4)
+
+    @patch("web_outlook_app.time.sleep")
+    @patch("web_outlook_app.post_with_proxy_fallback")
+    def test_graph_token_fallback_exponential_when_no_retry_after_header(self, mock_post, mock_sleep):
+        # 无 Retry-After 头：回退 2→4→8s 指数退避
+        mock_post.side_effect = [
+            self._make_response(429, {"error": "rate_limited"}),
+            self._make_response(429, {"error": "rate_limited"}),
+            self._make_response(429, {"error": "rate_limited"}),
+            self._make_response(200, {"access_token": "abc", "refresh_token": "rt"}),
+        ]
+        response = web_outlook_app.request_graph_token_response("cid", "rt")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_post.call_count, 4)
+        self.assertEqual(mock_sleep.call_args_list, [call(2), call(4), call(8)])
+
+    @patch("web_outlook_app.time.sleep")
+    @patch("web_outlook_app.post_with_proxy_fallback")
+    def test_graph_token_fallback_exponential_when_retry_after_is_http_date(self, mock_post, mock_sleep):
+        # Retry-After 为 HTTP 日期（无法解析为秒）→ 触发回退 2→4→8s
+        mock_post.side_effect = [
+            self._make_response(429, {"error": "rate_limited"}, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}),
+            self._make_response(429, {"error": "rate_limited"}, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}),
+            self._make_response(429, {"error": "rate_limited"}, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}),
+            self._make_response(200, {"access_token": "abc", "refresh_token": "rt"}),
+        ]
+        response = web_outlook_app.request_graph_token_response("cid", "rt")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_post.call_count, 4)
+        self.assertEqual(mock_sleep.call_args_list, [call(2), call(4), call(8)])
+
+    @patch("web_outlook_app.time.sleep")
+    @patch("web_outlook_app.post_with_proxy_fallback")
+    def test_graph_token_caps_large_retry_after_at_http_request_timeout(self, mock_post, mock_sleep):
+        # Retry-After: "60" 应被截断到 HTTP_REQUEST_TIMEOUT（30s），而非 8s
+        mock_post.side_effect = [
+            self._make_response(429, {"error": "rate_limited"}, headers={"Retry-After": "60"}),
+            self._make_response(200, {"access_token": "abc", "refresh_token": "rt"}),
+        ]
+        response = web_outlook_app.request_graph_token_response("cid", "rt")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_post.call_count, 2)
+        self.assertEqual(mock_sleep.call_args_list, [call(web_outlook_app.HTTP_REQUEST_TIMEOUT)])
 
 
 class SchedulerTimezoneMigrationTests(unittest.TestCase):

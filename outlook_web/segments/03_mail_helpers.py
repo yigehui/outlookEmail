@@ -416,9 +416,24 @@ def is_graph_token_scope_retryable_response(response) -> bool:
     ))
 
 
+def _retry_after_delay(response, attempt: int) -> float:
+    """解析 429 响应的 Retry-After 秒数；缺失或无法解析时回退到 2**(attempt+1)（2→4→8s）。"""
+    fallback = float(2 ** (attempt + 1))
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return fallback
+    retry_after = headers.get("Retry-After")
+    if retry_after is None:
+        return fallback
+    try:
+        return float(retry_after)
+    except (TypeError, ValueError):
+        return fallback
+
+
 def _post_token_with_429_backoff(url: str, data: Dict[str, Any], *, proxy_url: str = None,
                                   fallback_proxy_urls: Optional[List[str]] = None):
-    """POST token 端点；遇到 429 按 Retry-After（回退 2→4→8s）退避重试，最多 GRAPH_TOKEN_MAX_429_RETRIES 次。
+    """POST token 端点；遇到 429 按 Retry-After（回退 2→4→8s）退避重试，最多重试 3 次（共最多 4 次请求）。
 
     超过最大重试次数仍为 429 时，返回最后一次 429 响应由调用方决定如何处理。
     """
@@ -432,12 +447,16 @@ def _post_token_with_429_backoff(url: str, data: Dict[str, Any], *, proxy_url: s
     for attempt in range(GRAPH_TOKEN_MAX_429_RETRIES):
         if response.status_code != 429:
             return response
-        retry_after = response.headers.get("Retry-After") if getattr(response, "headers", None) else None
-        try:
-            delay = float(retry_after) if retry_after is not None else float(2 ** (attempt + 1))
-        except (TypeError, ValueError):
-            delay = float(2 ** (attempt + 1))
-        delay = min(delay, 8.0)
+        delay = _retry_after_delay(response, attempt)
+        # 以 HTTP_REQUEST_TIMEOUT 为上限：既尊重服务器较大的 Retry-After 提示，
+        # 又避免异常大的值导致刷新任务长时间阻塞。
+        delay = min(delay, float(HTTP_REQUEST_TIMEOUT))
+        app.logger.warning(
+            "Token endpoint %s returned 429 (attempt %d); retrying after %.1fs",
+            url,
+            attempt + 1,
+            delay,
+        )
         time.sleep(delay)
         response = post_with_proxy_fallback(
             url,
