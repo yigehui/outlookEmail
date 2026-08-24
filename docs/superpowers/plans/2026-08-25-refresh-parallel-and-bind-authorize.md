@@ -8,6 +8,49 @@
 
 **Tech Stack:** Flask, raw sqlite3, APScheduler, requests, ThreadPoolExecutor。测试 `unittest.TestCase` 跑 `python -m pytest tests/`。
 
+## 关键架构事实（执行前必读）
+
+**Segment 加载机制（`web_outlook_app.py:15-41`）：** `outlook_web/segments/*.py` 不是独立子模块——它们被 `exec(code, globals())` 加载进 `web_outlook_app` 模块的**同一个全局命名空间**。因此：
+
+1. **新增 segment 文件必须加入 `SEGMENT_FILES` 元组**（`web_outlook_app.py:15-27`），否则不会被加载。`12_cloudflare_mail.py` 与 `13_oauth_bind.py` 都要在此追加。
+2. **跨 segment 引用是裸名**，不是 import。例如 `11_routes_graph_oauth.py:426` 直接用 `encrypt_data(...)`（它由 `01_bootstrap.py` 定义并存在于共享 globals），没有 `from ... import`。同理 `extract_graph_refresh_token` 调 `bind_proof_in_session`、`create_or_get_address` 都是裸名——只要定义它们的 segment 已在 `SEGMENT_FILES` 中且排在调用方之前（`12`/`13` 在 `11` 之后，但因 `exec` 顺序加载、函数体在调用时才执行，**运行时**引用成立；**模块加载期**不能在 `12`/`13` 顶层代码里反向调用 `11` 的函数）。
+3. **测试一律经 `web_outlook_app` 访问**：`web_outlook_app = importlib.import_module('web_outlook_app')`（已在 `tests/test_project_runtime.py:22` 顶部 import），然后 `web_outlook_app.request_graph_token_response(...)`、`web_outlook_app.add_accounts_bulk(...)`、`web_outlook_app.upsert_graph_authorized_account(...)`、`web_outlook_app.run_batch_oauth_task(...)`。**禁止** `from outlook_web.segments.seg_NN_xxx import` 或 `from outlook_web.segments import mail_helpers`——这些路径不存在。**禁止** `init_app(reinit_db=True)`、`tempfile.mkdtemp()+chdir` 等模式——该模块级单例已加载，重载会冲突。
+4. **测试 setUp 用既有工作样板**（照抄 `RecoveryEmailTests`，tests/test_project_runtime.py:2102）：
+   ```python
+   class XxxTests(unittest.TestCase):
+       def setUp(self):
+           self.app = web_outlook_app.app
+           self.app.config['TESTING'] = True
+           self.app.config['WTF_CSRF_ENABLED'] = False
+           self.client = self.app.test_client()
+           with self.app.app_context():
+               web_outlook_app.init_db()
+               web_outlook_app.set_setting(
+                   web_outlook_app.LOGIN_SESSION_VERSION_SETTING_KEY,
+                   web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION,
+               )
+               db = web_outlook_app.get_db()
+               db.execute('DELETE FROM accounts')
+               db.execute('DELETE FROM outlook_upload_accounts')  # 暂存表
+               db.execute("DELETE FROM groups WHERE name NOT IN ('默认分组', '临时邮箱')")
+               web_outlook_app.set_setting('login_password', web_outlook_app.hash_password('export-pass'))
+               db.commit()
+           with self.client.session_transaction() as sess:
+               sess['logged_in'] = True
+               sess['login_session_version'] = web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION
+
+       def _verify(self):  # 需要调导出时用
+           resp = self.client.post('/api/export/verify', json={'password': 'export-pass'})
+           self.assertEqual(resp.status_code, 200)
+           return resp.get_json()['verify_token']
+   ```
+   - 查 DB：`with self.app.app_context(): row = web_outlook_app.get_db().execute("SELECT ...").fetchone()`，**不要** `sqlite3.connect`/`_open_db()`。
+   - 需 API Key 的测试：`with self.app.app_context(): web_outlook_app.set_setting('external_api_key', 'sk-test-123')`。
+5. mock 目标用 `web_outlook_app.<name>`：`@patch("web_outlook_app.post_with_proxy_fallback")`、`@patch("web_outlook_app.refresh_accounts_parallel")`、`@patch("web_outlook_app.run_graph_oauth_task")`、`@patch("web_outlook_app.create_or_get_address")`、`@patch("web_outlook_app.bind_proof_in_session")`、`@patch.object(web_outlook_app, 'encrypt_data', ...)`、`@patch.object(web_outlook_app, 'test_refresh_token', ...)`。被 patch 的名字必须存在于 `web_outlook_app` globals（被某 segment 顶层 `def` 定义），patch 后所有 segment 内对该裸名的引用都受影响。
+6. **设置读写**：`web_outlook_app.set_setting(key, value)` / `web_outlook_app.get_setting_value(key)`（已存在；实现时 grep `def set_setting` 确认）。
+
+**本计划中所有 `from outlook_web.segments... import`、`mh.xxx`/`refresh_mail.xxx`/`graph_oauth.xxx`/`groups_accounts.xxx`、`init_app(reinit_db=True)`、`tempfile+chdir`、`_open_db()` 写法均应按上述规则改写为 `web_outlook_app.<name>` + 既有 setUp 样板。** 下文任务代码块保留原写法作为逻辑参考，实现时按本节规则转译。
+
 设计稿：`docs/superpowers/specs/2026-08-25-refresh-parallel-and-bind-authorize-design.md`
 
 ---
@@ -20,8 +63,8 @@
 | `outlook_web/segments/03_mail_helpers.py` | token HTTP 调用 + 429 退避 | 修改 |
 | `outlook_web/segments/07_routes_oauth_settings_external.py` | 设置读写 + external 路由 + 批量授权路由 | 修改 |
 | `outlook_web/segments/01_bootstrap.py` | 设置项种子 | 修改 |
-| `outlook_web/segments/12_cloudflare_mail.py` | CF 临时邮箱收发（移植自 reg-factory） | 新建 |
-| `outlook_web/segments/13_oauth_bind.py` | `bind_proof_in_session` + 正则辅助（移植自 reg-factory） | 新建 |
+| `outlook_web/segments/12_cloudflare_mail.py` | CF 临时邮箱收发（移植自 reg-factory） | 新建（需加入 SEGMENT_FILES） |
+| `outlook_web/segments/13_oauth_bind.py` | `bind_proof_in_session` + 正则辅助（移植自 reg-factory） | 新建（需加入 SEGMENT_FILES） |
 | `outlook_web/segments/11_routes_graph_oauth.py` | 接入 bind + recovery 透传 + 批量授权 worker | 修改 |
 | `outlook_web/segments/02_groups_accounts.py` | `upsert_graph_authorized_account` 透传 recovery | 修改 |
 | `templates/partials/index/dialogs-primary.html` | 批量授权 UI | 修改 |
@@ -783,56 +826,69 @@ cp "D:/officeProject/yigehui/reg-factory/common/cloudflare_mail.py" "D:/officePr
 
 打开 `outlook_web/segments/12_cloudflare_mail.py`，顶部加模块说明并确认 `import requests`、`import os`、`import re` 等 stdlib 不变。把 reg-factory 里 `from common import ...` 风格的内联引用（若 cloudflare_mail.py 内部无跨文件 import 则无需改——确认它自包含）。
 
-检查 `_cf_session`（:57）里 `_resolve_proxy` 读 `CF_MAIL_PROXY` 环境变量——保留。新增一个 Flask settings 回退：在 `_resolve_proxy` 之前加：
+`_resolve_proxy`（:53）改为先读 env 再回退 DB settings（裸名 `get_setting_value`，由 `01_bootstrap.py` 定义于共享 globals）：
 
 ```python
 def _resolve_proxy():
     env = os.environ.get("CF_MAIL_PROXY")
     if env:
         return env
-    # 回退到 DB settings
     try:
-        from outlook_web.segments.bootstrap import get_setting_value
         return get_setting_value('cf_mail_proxy') or None
     except Exception:
         return None
 ```
 
-对称：`create_or_get_address` 读 `CF_MAIL_BASE/ADMIN/DOMAIN/SITE_PASS` 处加 settings 回退（用同一 `get_setting_value`）。
+对称：`create_or_get_address` 读 `CF_MAIL_BASE/ADMIN/DOMAIN/SITE_PASS` 处加 `get_setting_value(...)` 回退（env 优先）。
 
-- [ ] **Step 3: 写测试**
+- [ ] **Step 3: 注册到 SEGMENT_FILES**
 
-新增 `CloudflareMailTests`（纯单元，mock requests，不打真实网络）：
+在 `web_outlook_app.py:15-27` 的 `SEGMENT_FILES` 元组追加两项：
+
+```python
+    "10_routes_email_shares.py",
+    "11_routes_graph_oauth.py",
+    "12_cloudflare_mail.py",
+    "13_oauth_bind.py",
+)
+```
+
+（`13_oauth_bind.py` 文件在 F3.2 创建，但元组一次性加好。）
+
+- [ ] **Step 4: 写测试**
+
+新增 `CloudflareMailTests`（纯单元，mock requests，不打真实网络）。patch 目标是 `web_outlook_app.requests`（因 `12_cloudflare_mail.py` 顶层 `import requests` 后 `requests` 进入 `web_outlook_app` globals）：
 
 ```python
 class CloudflareMailTests(unittest.TestCase):
-    @patch("outlook_web.segments.seg_12_cloudflare_mail.requests.post")
+    @patch("web_outlook_app.requests.post")
     def test_create_or_get_address_returns_address(self, mock_post):
         import types
         resp = types.SimpleNamespace()
         resp.status_code = 200
         resp.json = lambda: {"jwt": "j", "address": "ms-foo@bar.com", "address_id": 1}
+        resp.text = "{}"
         mock_post.return_value = resp
-        from outlook_web.segments import seg_12_cloudflare_mail as cm
-        # 注入 base/admin/domain（避免依赖 env）
-        cm._BASE = "https://mail.example.com"
-        cm._ADMIN = "adminpw"
-        cm._DOMAIN = "example.com"
-        result = cm.create_or_get_address("foo@outlook.com")
+        # 注入 base/admin/domain（避免依赖 env）——经 web_outlook_app globals
+        import web_outlook_app
+        web_outlook_app._CF_BASE = "https://mail.example.com"
+        web_outlook_app._CF_ADMIN = "adminpw"
+        web_outlook_app._CF_DOMAIN = "example.com"
+        result = web_outlook_app.create_or_get_address("foo@outlook.com")
         self.assertEqual(result["address"], "ms-foo@bar.com")
 ```
 
-注：若源模块用函数内 `os.environ.get` 而非模块级常量，则测试用 `monkeypatch` env 或 `@patch.dict(os.environ, {...})`。实现时以源码实际为准。
+注：若源模块用 `os.environ.get` 读 `CF_MAIL_BASE` 而非模块级常量，则测试用 `@patch.dict("web_outlook_app.os.environ", {...})`。实现时以源码实际为准，统一经 `web_outlook_app.<name>` 访问。
 
-- [ ] **Step 4: 验证通过**
+- [ ] **Step 5: 验证通过**
 
 Run: `python -m pytest tests/test_project_runtime.py::CloudflareMailTests -v`
 Expected: PASS
 
-- [ ] **Step 5: 提交**
+- [ ] **Step 6: 提交**
 
 ```bash
-git add outlook_web/segments/12_cloudflare_mail.py tests/test_project_runtime.py
+git add web_outlook_app.py outlook_web/segments/12_cloudflare_mail.py tests/test_project_runtime.py
 git commit -m "feat(bind): 移植 cloudflare_mail 模块为 segment 12
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
@@ -870,43 +926,54 @@ import urllib.parse
 ```python
         from common import cloudflare_mail as cm_module
 ```
-改为：
+改为裸名引用（`cloudflare_mail` 的函数已由 `12_cloudflare_mail.py` 定义在共享 globals，但 `bind_proof_in_session` 需要 *模块对象* 来调 `cm.wait_for_code` 等）——把参数从 `cm_module` 改为直接用 `12_cloudflare_mail.py` 里被顶层 `def` 暴露的函数名。最简做法：在 `bind_proof_in_session` 顶部用裸名引用 CF 函数：
+
 ```python
-        from outlook_web.segments import seg_12_cloudflare_mail as cm_module
+def bind_proof_in_session(session, html, url, cf_address, cf_jwt=None, use_admin=False, idx=0,
+                          cm_module=None, max_wait=180, poll=3):
+    """..."""
+    tag = f"[#{idx}]"
+    # cm_module 兼容旧签名；新实现直接用共享 globals 里的 cf 函数（裸名）
+    cf_wait_for_code = wait_for_code          # 由 12_cloudflare_mail.py 定义
+    cf_fetch_admin_mails = fetch_admin_mails
+    cf_fetch_parsed_mails = fetch_parsed_mails
+    ...
 ```
 
-`_graph_log` 若源文件里是模块级 helper，在新文件里用一个最小实现替代：
+把函数体内所有 `cm.wait_for_code(...)`→`cf_wait_for_code(...)`、`cm.fetch_admin_mails(...)`→`cf_fetch_admin_mails(...)`、`cm.fetch_parsed_mails(...)`→`cf_fetch_parsed_mails(...)`、`cm.parse_admin_mail(...)`→`parse_admin_mail(...)`（裸名，需 `12_cloudflare_mail.py` 顶层定义这些函数——移植时确认它们都是顶层 `def`）。
+
+`_graph_log` 用最小实现（同 segment 内顶层 `def`，裸名可用）：
 ```python
 def _graph_log(tag, msg, level="INFO"):
     import sys
     print(f"{level} {tag} {msg}", file=sys.stderr)
 ```
-（与现有 `graph_oauth_log` 风格对齐即可，实现时若 `11_routes_graph_oauth.py` 已有 `graph_oauth_log` 可复用。）
+（若 `11_routes_graph_oauth.py` 已有 `graph_oauth_log` 可直接复用——它是共享 globals 裸名。）
 
 - [ ] **Step 3: 写测试（HTML 固件）**
 
-新增 `BindProofTests`，用录制的 HTML 片段验证 `_parse_proof_add_form` / `_parse_proof_verify_form`：
+新增 `BindProofTests`，用录制的 HTML 片段验证 `_parse_proof_add_form` / `_parse_proof_verify_form`，经 `web_outlook_app` 访问：
 
 ```python
 class BindProofTests(unittest.TestCase):
     def test_parse_proof_add_form_extracts_action_and_hidden_inputs(self):
-        from outlook_web.segments import seg_13_oauth_bind as ob
+        import web_outlook_app
         html = '''
         <form action="/proofs/Add?canary=ABC" method="post">
           <input type="hidden" name="canary" value="ABC"/>
           <input type="hidden" name="hid" value="X"/>
         </form>'''
-        action, data = ob._parse_proof_add_form(html, "https://account.live.com/proofs/Add")
+        action, data = web_outlook_app._parse_proof_add_form(html, "https://account.live.com/proofs/Add")
         self.assertIsNotNone(action)
         self.assertEqual(data.get("canary"), "ABC")
 
     def test_parse_proof_verify_form_extracts_epid_action(self):
-        from outlook_web.segments import seg_13_oauth_bind as ob
+        import web_outlook_app
         html = '''
         <form action="/proofs/Verify?epid=ZZ" method="post">
           <input type="hidden" name="canary" value="C"/>
         </form>'''
-        action, data = ob._parse_proof_verify_form(html, "https://account.live.com/proofs/Verify")
+        action, data = web_outlook_app._parse_proof_verify_form(html, "https://account.live.com/proofs/Verify")
         self.assertIn("epid", action)
 ```
 
@@ -1076,12 +1143,7 @@ Expected: PASS
 
 在 `outlook_web/segments/11_routes_graph_oauth.py`：
 
-1. 顶部 import：
-```python
-from outlook_web.segments.seg_12_cloudflare_mail import create_or_get_address as cf_create_or_get_address
-from outlook_web.segments.seg_13_oauth_bind import bind_proof_in_session
-```
-（若 segment 文件按 `12_cloudflare_mail`/`13_oauth_bind` 命名无法直接 `import 数字开头`，则用 `importlib` 或在 `web_outlook_app.py` 的 segment 加载器里把这两个文件注册为 `seg_12_cloudflare_mail` / `seg_13_oauth_bind` 模块名——实现时读 `web_outlook_app.py` 的 segment 加载逻辑确认命名约定。）
+1. 顶部 import：**无需 import**（共享 globals 裸名）。`create_or_get_address` 与 `bind_proof_in_session` 由 `12_cloudflare_mail.py`/`13_oauth_bind.py` 顶层定义并已在 `SEGMENT_FILES` 中。在 `extract_graph_refresh_token` 函数体内直接用裸名 `create_or_get_address(...)`、`bind_proof_in_session(...)` 即可。注意加载顺序���`12`/`13` 在 `11` 之后加载，但函数体在运行时才执行，运行时引用成立。
 
 2. `extract_graph_refresh_token` 签名加参：
 ```python
