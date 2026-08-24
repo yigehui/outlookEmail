@@ -2099,6 +2099,205 @@ class ProjectRuntimeTests(unittest.TestCase):
                 self.assertEqual(archive.read('invoice.txt'), b'second body')
 
 
+class RecoveryEmailTests(unittest.TestCase):
+    """辅助邮箱 / 辅助邮箱密码：导入、导出、详情、编辑保留/更新。"""
+
+    def setUp(self):
+        self.app = web_outlook_app.app
+        self.app.config['TESTING'] = True
+        self.app.config['WTF_CSRF_ENABLED'] = False
+        self.client = self.app.test_client()
+
+        with self.app.app_context():
+            web_outlook_app.init_db()
+            web_outlook_app.set_setting(
+                web_outlook_app.LOGIN_SESSION_VERSION_SETTING_KEY,
+                web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION,
+            )
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM account_tags')
+            db.execute('DELETE FROM tags')
+            db.execute('DELETE FROM account_aliases')
+            db.execute('DELETE FROM accounts')
+            db.execute("DELETE FROM groups WHERE name NOT IN ('默认分组', '临时邮箱')")
+            web_outlook_app.set_setting('login_password', web_outlook_app.hash_password('export-pass'))
+            db.commit()
+
+        with self.client.session_transaction() as sess:
+            sess['logged_in'] = True
+            sess['login_session_version'] = web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION
+
+    def _verify_token(self):
+        resp = self.client.post('/api/export/verify', json={'password': 'export-pass'})
+        self.assertEqual(resp.status_code, 200)
+        return resp.get_json()['verify_token']
+
+    def test_import_6_segments_stores_recovery_email_and_encrypted_password(self):
+        line = 'rec6@example.com----pw6----client-6----refresh-6----rec6@nuo.dpdns.org----recpw6'
+        response = self.client.post('/api/accounts', json={
+            'account_string': line, 'group_id': 1, 'provider': 'outlook',
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()['success'])
+
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            row = db.execute(
+                'SELECT recovery_email, recovery_email_password FROM accounts WHERE email = ?',
+                ('rec6@example.com',)
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row['recovery_email'], 'rec6@nuo.dpdns.org')
+            # 入库为密文
+            self.assertNotEqual(row['recovery_email_password'], 'recpw6')
+            self.assertEqual(web_outlook_app.decrypt_data(row['recovery_email_password']), 'recpw6')
+
+    def test_import_4_segments_keeps_recovery_empty_for_backward_compatibility(self):
+        line = 'rec4@example.com----pw4----client-4----refresh-4'
+        response = self.client.post('/api/accounts', json={
+            'account_string': line, 'group_id': 1, 'provider': 'outlook',
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()['success'])
+
+        with self.app.app_context():
+            row = web_outlook_app.get_db().execute(
+                'SELECT recovery_email, recovery_email_password FROM accounts WHERE email = ?',
+                ('rec4@example.com',)
+            ).fetchone()
+            self.assertEqual(row['recovery_email'], '')
+            self.assertEqual(row['recovery_email_password'], '')  # 4 段导入留空
+
+    def test_parse_outlook_account_string_reads_segments_5_and_6(self):
+        parsed = web_outlook_app.parse_outlook_account_string(
+            'parse@example.com----pw----client----refresh----rec@x.com----recpw'
+        )
+        self.assertEqual(parsed['recovery_email'], 'rec@x.com')
+        self.assertEqual(parsed['recovery_email_password'], 'recpw')
+
+        parsed_short = web_outlook_app.parse_outlook_account_string(
+            'parse2@example.com----pw----client----refresh'
+        )
+        self.assertEqual(parsed_short['recovery_email'], '')
+        self.assertEqual(parsed_short['recovery_email_password'], '')
+
+    def test_export_outputs_6_segments_when_recovery_present(self):
+        account_id = self._insert_outlook_account_with_recovery('exp6@example.com', 'rec@x.com', 'recpw6')
+        verify_token = self._verify_token()
+        response = self.client.post('/api/accounts/export-selected', json={
+            'account_ids': [account_id], 'verify_token': verify_token,
+        })
+        self.assertEqual(response.status_code, 200)
+        line = response.get_data(as_text=True).strip()
+        segments = line.split('----')
+        self.assertEqual(len(segments), 6)
+        self.assertEqual(segments[0], 'exp6@example.com')
+        self.assertEqual(segments[4], 'rec@x.com')
+        self.assertEqual(segments[5], 'recpw6')  # 导出为明文
+
+    def test_export_outputs_4_segments_when_recovery_absent(self):
+        account_id = self._insert_outlook_account('exp4@example.com', 'pw4', 'client4', 'refresh4')
+        verify_token = self._verify_token()
+        response = self.client.post('/api/accounts/export-selected', json={
+            'account_ids': [account_id], 'verify_token': verify_token,
+        })
+        self.assertEqual(response.status_code, 200)
+        line = response.get_data(as_text=True).strip()
+        self.assertEqual(len(line.split('----')), 4)
+        self.assertEqual(line, 'exp4@example.com----pw4----client4----refresh4')
+
+    def test_detail_api_returns_recovery_fields(self):
+        account_id = self._insert_outlook_account_with_recovery('det@example.com', 'det@x.com', 'detpw')
+        response = self.client.get(f'/api/accounts/{account_id}')
+        self.assertEqual(response.status_code, 200)
+        acc = response.get_json()['account']
+        self.assertEqual(acc['recovery_email'], 'det@x.com')
+        self.assertTrue(acc['has_recovery_email_password'])
+        self.assertEqual(acc['recovery_email_password'], 'detpw')  # 已解密
+
+    def test_edit_preserves_recovery_password_when_secret_not_submitted(self):
+        account_id = self._insert_outlook_account_with_recovery('keep@example.com', 'keep@x.com', 'keeppw')
+        base = {
+            'email': 'keep@example.com', 'client_id': 'client', 'refresh_token': 'refresh',
+            'account_type': 'outlook', 'provider': 'outlook', 'group_id': 1,
+            'status': 'active', 'recovery_email': 'keep@x.com',  # 密码未提交
+        }
+        response = self.client.put(f'/api/accounts/{account_id}', json=base)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()['success'])
+
+        with self.app.app_context():
+            row = web_outlook_app.get_db().execute(
+                'SELECT recovery_email_password FROM accounts WHERE id = ?', (account_id,)
+            ).fetchone()
+            self.assertEqual(web_outlook_app.decrypt_data(row['recovery_email_password']), 'keeppw')
+
+    def test_edit_updates_recovery_password_when_submitted(self):
+        account_id = self._insert_outlook_account_with_recovery('upd@example.com', 'upd@x.com', 'oldpw')
+        base = {
+            'email': 'upd@example.com', 'client_id': 'client', 'refresh_token': 'refresh',
+            'account_type': 'outlook', 'provider': 'outlook', 'group_id': 1,
+            'status': 'active', 'recovery_email': 'upd@x.com',
+            'recovery_email_password': 'newpw',
+        }
+        response = self.client.put(f'/api/accounts/{account_id}', json=base)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()['success'])
+
+        with self.app.app_context():
+            row = web_outlook_app.get_db().execute(
+                'SELECT recovery_email_password FROM accounts WHERE id = ?', (account_id,)
+            ).fetchone()
+            self.assertEqual(web_outlook_app.decrypt_data(row['recovery_email_password']), 'newpw')
+
+    def test_update_account_without_recovery_params_preserves_existing_values(self):
+        # 模拟非 UI 调用（如转发调度），不传 recovery 参数 → 保留原值
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            cursor = db.execute(
+                "INSERT INTO accounts (email, password, client_id, refresh_token, recovery_email, recovery_email_password, "
+                "account_type, provider, imap_host, imap_port) "
+                "VALUES ('nonui@example.com', ?, 'cid', 'rt', 'nonui@x.com', ?, 'outlook', 'outlook', '', 993)",
+                (web_outlook_app.encrypt_data('pw'), web_outlook_app.encrypt_data('nonuipw'))
+            )
+            account_id = int(cursor.lastrowid)
+            db.commit()
+
+            ok = web_outlook_app.update_account(
+                account_id, 'nonui@example.com', 'pw', 'cid', 'rt', 1, None, '', 'active',
+                'outlook', 'outlook', '', 993, '', False, '', '', '',
+            )
+            self.assertTrue(ok)
+            row = db.execute(
+                'SELECT recovery_email, recovery_email_password FROM accounts WHERE id = ?',
+                (account_id,)
+            ).fetchone()
+            self.assertEqual(row['recovery_email'], 'nonui@x.com')
+            self.assertEqual(web_outlook_app.decrypt_data(row['recovery_email_password']), 'nonuipw')
+
+    def _insert_outlook_account(self, email, password, client_id, refresh_token):
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            cursor = db.execute(
+                "INSERT INTO accounts (email, password, client_id, refresh_token, account_type, provider) "
+                "VALUES (?, ?, ?, ?, 'outlook', 'outlook')",
+                (email, password, client_id, refresh_token)
+            )
+            db.commit()
+            return int(cursor.lastrowid)
+
+    def _insert_outlook_account_with_recovery(self, email, recovery_email, recovery_password):
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            cursor = db.execute(
+                "INSERT INTO accounts (email, password, client_id, refresh_token, recovery_email, recovery_email_password, "
+                "account_type, provider) VALUES (?, ?, 'client', 'refresh', ?, ?, 'outlook', 'outlook')",
+                (email, 'pw', recovery_email, web_outlook_app.encrypt_data(recovery_password))
+            )
+            db.commit()
+            return int(cursor.lastrowid)
+
+
 class FrontendColorPickerTests(unittest.TestCase):
     def test_color_picker_initialization_block_calls_init_once(self):
         core_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '01-core.js').read_text(encoding='utf-8')

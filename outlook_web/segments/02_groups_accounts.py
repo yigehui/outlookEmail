@@ -996,6 +996,11 @@ def resolve_account_record(row: sqlite3.Row, matched_alias: str = '',
             account['imap_password'] = decrypt_data(account['imap_password'])
         except Exception:
             pass
+    if account.get('recovery_email_password'):
+        try:
+            account['recovery_email_password'] = decrypt_data(account['recovery_email_password'])
+        except Exception:
+            pass
     account['provider'] = normalize_provider(account.get('provider'), account.get('email', ''))
     account['account_type'] = account.get('account_type') or get_provider_meta(
         account['provider'], account.get('email', '')
@@ -1406,9 +1411,10 @@ ACCOUNT_INSERT_SQL = '''
     INSERT OR IGNORE INTO accounts (
         email, password, client_id, refresh_token, group_id, sort_order, remark,
         status, account_type, provider, imap_host, imap_port, imap_password, forward_enabled,
-        forward_last_checked_at, proxy_url, fallback_proxy_url_1, fallback_proxy_url_2
+        forward_last_checked_at, proxy_url, fallback_proxy_url_1, fallback_proxy_url_2,
+        recovery_email, recovery_email_password
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 '''
 
 
@@ -1418,10 +1424,12 @@ def build_account_insert_values(email_addr: str, password: str, client_id: str =
                                 imap_password: str = '', forward_enabled: bool = False,
                                 sort_order: Optional[int] = None, status: str = 'active',
                                 proxy_url: str = '', fallback_proxy_url_1: str = '',
-                                fallback_proxy_url_2: str = '') -> tuple:
+                                fallback_proxy_url_2: str = '',
+                                recovery_email: str = '', recovery_email_password: str = '') -> tuple:
     encrypted_password = encrypt_data(password) if password else password
     encrypted_refresh_token = encrypt_data(refresh_token) if refresh_token else refresh_token
     encrypted_imap_password = encrypt_data(imap_password) if imap_password else imap_password
+    encrypted_recovery_email_password = encrypt_data(recovery_email_password) if recovery_email_password else recovery_email_password
     provider_meta = get_provider_meta(provider, email_addr)
     normalized_provider = provider_meta['key']
     normalized_account_type = account_type or provider_meta.get('account_type', 'outlook')
@@ -1449,6 +1457,8 @@ def build_account_insert_values(email_addr: str, password: str, client_id: str =
         str(proxy_url or '').strip(),
         str(fallback_proxy_url_1 or '').strip(),
         str(fallback_proxy_url_2 or '').strip(),
+        str(recovery_email or '').strip(),
+        encrypted_recovery_email_password,
     )
 
 
@@ -1458,7 +1468,8 @@ def add_account(email_addr: str, password: str, client_id: str = '', refresh_tok
                 imap_password: str = '', forward_enabled: bool = False,
                 sort_order: Optional[int] = None, status: str = 'active',
                 proxy_url: str = '', fallback_proxy_url_1: str = '',
-                fallback_proxy_url_2: str = '') -> bool:
+                fallback_proxy_url_2: str = '',
+                recovery_email: str = '', recovery_email_password: str = '') -> bool:
     """添加邮箱账号"""
     db = get_db()
     try:
@@ -1467,7 +1478,8 @@ def add_account(email_addr: str, password: str, client_id: str = '', refresh_tok
             email_addr, password, client_id, refresh_token, group_id, remark,
             account_type, provider, imap_host, imap_port, imap_password,
             forward_enabled, sort_order, status,
-            proxy_url, fallback_proxy_url_1, fallback_proxy_url_2
+            proxy_url, fallback_proxy_url_1, fallback_proxy_url_2,
+            recovery_email, recovery_email_password
         ))
         db.commit()
         return db.total_changes > before_changes
@@ -1514,7 +1526,9 @@ def add_accounts_bulk(parsed_accounts: List[Dict[str, Any]], group_id: int = 1,
             normalized_status,
             proxy_url,
             fallback_proxy_url_1,
-            fallback_proxy_url_2
+            fallback_proxy_url_2,
+            parsed.get('recovery_email', ''),
+            parsed.get('recovery_email_password', '')
         )
         for parsed in parsed_accounts
     ]
@@ -2040,7 +2054,9 @@ def update_account(account_id: int, email_addr: str, password: str, client_id: s
                    imap_host: str = '', imap_port: int = 993, imap_password: str = '',
                    forward_enabled: bool = False, proxy_url: str = '',
                    fallback_proxy_url_1: str = '', fallback_proxy_url_2: str = '',
-                   authorization_type: Optional[str] = None) -> bool:
+                   authorization_type: Optional[str] = None,
+                   recovery_email: Optional[str] = None,
+                   recovery_email_password: Optional[str] = None) -> bool:
     """更新邮箱账号"""
     db = get_db()
     try:
@@ -2054,7 +2070,8 @@ def update_account(account_id: int, email_addr: str, password: str, client_id: s
         normalized_fallback_proxy_url_2 = str(fallback_proxy_url_2 or '').strip()
 
         current_account = db.execute(
-            'SELECT forward_enabled, forward_last_checked_at, account_type, authorization_type FROM accounts WHERE id = ?',
+            'SELECT forward_enabled, forward_last_checked_at, account_type, authorization_type, '
+            'recovery_email, recovery_email_password FROM accounts WHERE id = ?',
             (account_id,)
         ).fetchone()
         effective_authorization_type = (
@@ -2064,6 +2081,19 @@ def update_account(account_id: int, email_addr: str, password: str, client_id: s
         )
         if str(account_type or '').strip().lower() == 'imap':
             effective_authorization_type = ''
+        # recovery 字段：None=未提供→保留原值；''=显式清空
+        effective_recovery_email = (
+            recovery_email if recovery_email is not None
+            else (current_account['recovery_email'] if current_account else '')
+        )
+        effective_recovery_email_password_raw = (
+            recovery_email_password if recovery_email_password is not None
+            else (current_account['recovery_email_password'] if current_account else '')
+        )
+        encrypted_recovery_email_password = (
+            encrypt_data(effective_recovery_email_password_raw)
+            if effective_recovery_email_password_raw else effective_recovery_email_password_raw
+        )
         should_init_forward_cursor = bool(
             forward_enabled and current_account and not current_account['forward_enabled']
         )
@@ -2076,14 +2106,16 @@ def update_account(account_id: int, email_addr: str, password: str, client_id: s
                     authorization_type = ?,
                     imap_host = ?, imap_port = ?, imap_password = ?, forward_enabled = ?,
                     forward_last_checked_at = ?, proxy_url = ?, fallback_proxy_url_1 = ?,
-                    fallback_proxy_url_2 = ?, updated_at = CURRENT_TIMESTAMP
+                    fallback_proxy_url_2 = ?, recovery_email = ?, recovery_email_password = ?,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
             ''', (
                 email_addr, encrypted_password, client_id, encrypted_refresh_token, group_id, normalized_sort_order,
                 remark, status,
                 account_type, provider, effective_authorization_type, imap_host, imap_port, encrypted_imap_password, 1,
                 datetime.now(timezone.utc).isoformat(), normalized_proxy_url,
-                normalized_fallback_proxy_url_1, normalized_fallback_proxy_url_2, account_id
+                normalized_fallback_proxy_url_1, normalized_fallback_proxy_url_2,
+                effective_recovery_email, encrypted_recovery_email_password, account_id
             ))
         else:
             db.execute('''
@@ -2093,13 +2125,15 @@ def update_account(account_id: int, email_addr: str, password: str, client_id: s
                     authorization_type = ?,
                     imap_host = ?, imap_port = ?, imap_password = ?, forward_enabled = ?,
                     proxy_url = ?, fallback_proxy_url_1 = ?, fallback_proxy_url_2 = ?,
+                    recovery_email = ?, recovery_email_password = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
             ''', (
                 email_addr, encrypted_password, client_id, encrypted_refresh_token, group_id, normalized_sort_order,
                 remark, status,
                 account_type, provider, effective_authorization_type, imap_host, imap_port, encrypted_imap_password, 1 if forward_enabled else 0,
-                normalized_proxy_url, normalized_fallback_proxy_url_1, normalized_fallback_proxy_url_2, account_id
+                normalized_proxy_url, normalized_fallback_proxy_url_1, normalized_fallback_proxy_url_2,
+                effective_recovery_email, encrypted_recovery_email_password, account_id
             ))
         db.commit()
         return True
@@ -3710,6 +3744,9 @@ def parse_outlook_account_string(account_str: str, account_format: str = 'client
     if not client_id or not refresh_token:
         return None
 
+    recovery_email = parts[4] if len(parts) > 4 else ''
+    recovery_email_password = parts[5] if len(parts) > 5 else ''
+
     return {
         'email': email_addr,
         'password': password,
@@ -3720,6 +3757,8 @@ def parse_outlook_account_string(account_str: str, account_format: str = 'client
         'imap_host': IMAP_SERVER_NEW,
         'imap_port': IMAP_PORT,
         'imap_password': '',
+        'recovery_email': recovery_email,
+        'recovery_email_password': recovery_email_password,
     }
 
 

@@ -493,7 +493,11 @@ def format_account_export_line(account: Dict[str, Any]) -> str:
         if provider == 'custom':
             return f"{account['email']}----{imap_password}----{account.get('imap_host', '')}----{account.get('imap_port', 993)}"
         return f"{account['email']}----{imap_password}"
-    return f"{account['email']}----{account.get('password', '')}----{account.get('client_id', '')}----{account.get('refresh_token', '')}"
+    base = f"{account['email']}----{account.get('password', '')}----{account.get('client_id', '')}----{account.get('refresh_token', '')}"
+    recovery_email = account.get('recovery_email', '')
+    if recovery_email:
+        return f"{base}----{recovery_email}----{account.get('recovery_email_password', '')}"
+    return base
 
 
 def build_group_export_content(group_ids: List[int]) -> Dict[str, Any]:
@@ -1290,6 +1294,9 @@ def api_get_account(account_id):
             'imap_port': account.get('imap_port', 993),
             'has_imap_password': bool(account.get('imap_password')),
             'imap_password': account.get('imap_password', '') or '',
+            'recovery_email': account.get('recovery_email', '') or '',
+            'has_recovery_email_password': bool(account.get('recovery_email_password')),
+            'recovery_email_password': account.get('recovery_email_password', '') or '',
             'aliases': account.get('aliases', []),
             'alias_count': account.get('alias_count', 0),
             'matched_alias': account.get('matched_alias', ''),
@@ -1485,6 +1492,11 @@ def api_update_account(account_id):
     fallback_proxy_url_2 = str(
         data.get('fallback_proxy_url_2', current_account.get('fallback_proxy_url_2', '')) or ''
     ).strip()
+    recovery_email = data.get('recovery_email', current_account.get('recovery_email', ''))
+    recovery_email_password = (
+        data['recovery_email_password'] if 'recovery_email_password' in data
+        else current_account.get('recovery_email_password', '')
+    )
     aliases_provided = 'aliases' in data
     aliases = parse_alias_payload(data.get('aliases', [])) if aliases_provided else []
     tag_ids_provided = 'tag_ids' in data
@@ -1525,7 +1537,9 @@ def api_update_account(account_id):
         account_id, email_addr, password, client_id, refresh_token, group_id, sort_order, remark, status,
         account_type, provider, imap_host, imap_port, imap_password, forward_enabled,
         proxy_url, fallback_proxy_url_1, fallback_proxy_url_2,
-        authorization_type
+        authorization_type,
+        recovery_email=recovery_email,
+        recovery_email_password=recovery_email_password
     ):
         cleaned_aliases = get_account_aliases(account_id)
         db = get_db()

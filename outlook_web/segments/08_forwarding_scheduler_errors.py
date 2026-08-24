@@ -1517,6 +1517,11 @@ def api_update_account_v2(account_id):
     fallback_proxy_url_2 = str(
         data.get('fallback_proxy_url_2', current_account.get('fallback_proxy_url_2', '')) or ''
     ).strip()
+    recovery_email = data.get('recovery_email', current_account.get('recovery_email', ''))
+    recovery_email_password = (
+        data['recovery_email_password'] if 'recovery_email_password' in data
+        else current_account.get('recovery_email_password', '')
+    )
     aliases_provided = 'aliases' in data
     aliases = parse_alias_payload(data.get('aliases', [])) if aliases_provided else []
     tag_ids_provided = 'tag_ids' in data
@@ -1582,7 +1587,9 @@ def api_update_account_v2(account_id):
         proxy_url,
         fallback_proxy_url_1,
         fallback_proxy_url_2,
-        authorization_type
+        authorization_type,
+        recovery_email=recovery_email,
+        recovery_email_password=recovery_email_password
     ):
         cleaned_aliases = get_account_aliases(account_id)
         db = get_db()

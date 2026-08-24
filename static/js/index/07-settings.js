@@ -88,9 +88,14 @@
             if (!input || !button) return;
 
             const isRevealed = input.dataset.secretRevealed === 'true';
-            const isImap = inputId === 'editImapPassword';
-            const showLabel = isImap ? '显示 IMAP 密码' : '显示密码';
-            const hideLabel = isImap ? '隐藏 IMAP 密码' : '隐藏密码';
+            const labelMap = {
+                editPassword: '密码',
+                editImapPassword: 'IMAP 密码',
+                editRecoveryPassword: '辅助邮箱密码',
+            };
+            const label = labelMap[inputId] || '密码';
+            const showLabel = `显示${label}`;
+            const hideLabel = `隐藏${label}`;
 
             if (isRevealed) {
                 input.value = input.dataset.secretMask || '';
@@ -112,6 +117,7 @@
         function clearEditAccountSecrets() {
             resetEditSecretInput('editPassword', 'revealEditPasswordBtn', false, '', '可选');
             resetEditSecretInput('editImapPassword', 'revealEditImapPasswordBtn', false, '', '');
+            resetEditSecretInput('editRecoveryPassword', 'revealEditRecoveryPasswordBtn', false, '', '可选');
             editAccountSecretState = {
                 accountId: ''
             };
@@ -1374,6 +1380,8 @@
                     resetEditSecretInput('editImapPassword', 'revealEditImapPasswordBtn', !!acc.has_imap_password, acc.imap_password || '', '');
                     document.getElementById('editImapHost').value = acc.imap_host || '';
                     document.getElementById('editImapPort').value = acc.imap_port || 993;
+                    document.getElementById('editRecoveryEmail').value = acc.recovery_email || '';
+                    resetEditSecretInput('editRecoveryPassword', 'revealEditRecoveryPasswordBtn', !!acc.has_recovery_email_password, acc.recovery_email_password || '', '可选');
                     document.getElementById('editGroupSelect').value = acc.group_id || 1;
                     document.getElementById('editProxyUrl').value = acc.proxy_url || '';
                     document.getElementById('editFallbackProxyUrl1').value = acc.fallback_proxy_url_1 || '';
@@ -1443,6 +1451,11 @@
             if (shouldSubmitSecretInput(imapPasswordInput)) {
                 data.imap_password = imapPasswordValue;
             }
+            const recoveryPasswordInput = document.getElementById('editRecoveryPassword');
+            if (shouldSubmitSecretInput(recoveryPasswordInput)) {
+                data.recovery_email_password = recoveryPasswordInput.value;
+            }
+            data.recovery_email = document.getElementById('editRecoveryEmail').value.trim();
 
             if (isOutlook) {
                 if (!data.email || !data.client_id || !data.refresh_token) {

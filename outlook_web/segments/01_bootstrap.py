@@ -1360,6 +1360,8 @@ def init_db():
             imap_host TEXT,
             imap_port INTEGER DEFAULT 993,
             imap_password TEXT,
+            recovery_email TEXT DEFAULT '',
+            recovery_email_password TEXT,
             forward_enabled INTEGER DEFAULT 0,
             forward_last_checked_at TIMESTAMP,
             proxy_url TEXT DEFAULT '',
@@ -1824,6 +1826,10 @@ def init_db():
         cursor.execute('ALTER TABLE accounts ADD COLUMN imap_port INTEGER DEFAULT 993')
     if 'imap_password' not in columns:
         cursor.execute('ALTER TABLE accounts ADD COLUMN imap_password TEXT')
+    if 'recovery_email' not in columns:
+        cursor.execute("ALTER TABLE accounts ADD COLUMN recovery_email TEXT DEFAULT ''")
+    if 'recovery_email_password' not in columns:
+        cursor.execute('ALTER TABLE accounts ADD COLUMN recovery_email_password TEXT')
     if 'forward_enabled' not in columns:
         cursor.execute('ALTER TABLE accounts ADD COLUMN forward_enabled INTEGER DEFAULT 0')
     if 'forward_last_checked_at' not in columns:

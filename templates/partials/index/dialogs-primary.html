@@ -184,7 +184,7 @@
                             <label class="form-label">账号信息</label>
                             <textarea class="form-textarea import-account-textarea" id="accountInput"
                                 placeholder="邮箱----密码----client_id----refresh_token"></textarea>
-                            <div class="form-hint" id="importFormatHint">Outlook 支持两种格式并自动识别：邮箱----密码----client_id----refresh_token 或 邮箱----密码----refresh_token----client_id
+                            <div class="form-hint" id="importFormatHint">Outlook 支持两种格式并自动识别：邮箱----密码----client_id----refresh_token 或 邮箱----密码----refresh_token----client_id；可在末尾继续接 ----辅助邮箱----辅助邮箱密码 共 6 段
                             </div>
                             <div id="importFormatExample" class="import-format-example">
                             </div>
@@ -341,6 +341,31 @@
                                         <label class="form-label">IMAP 端口</label>
                                         <input type="number" class="form-input" id="editImapPort" value="993" min="1" max="65535">
                                     </div>
+                                </div>
+                            </div>
+                        </div>
+                    </details>
+
+                    <details class="edit-account-section">
+                        <summary>
+                            <span>辅助邮箱</span>
+                            <small>可选，用于账号找回</small>
+                        </summary>
+                        <div class="edit-account-grid edit-account-grid--compact">
+                            <div class="form-group">
+                                <label class="form-label">辅助邮箱</label>
+                                <input type="text" class="form-input" id="editRecoveryEmail" placeholder="可选">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">辅助邮箱密码</label>
+                                <div class="secret-input-row">
+                                    <input type="text" class="form-input" id="editRecoveryPassword" placeholder="可选">
+                                    <button type="button" class="secret-reveal-btn" id="revealEditRecoveryPasswordBtn" onclick="toggleEditSecretVisibility('editRecoveryPassword', 'revealEditRecoveryPasswordBtn')" title="显示辅助邮箱密码" aria-label="显示辅助邮箱密码" style="display: none;">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                            <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z"></path>
+                                            <circle cx="12" cy="12" r="3"></circle>
+                                        </svg>
+                                    </button>
                                 </div>
                             </div>
                         </div>
