@@ -19,6 +19,9 @@ DIRECT_PROXY_SENTINEL = "__DIRECT__"
 # 用非空占位密码强制走 UserPass；Resin 在 RESIN_PROXY_TOKEN="" 时接受任意密码。
 SOCKS_EMPTY_PASSWORD_PLACEHOLDER = "\x00"
 
+# token 刷新遇到 429 时的最大重试次数（每个账户、每次刷新请求）。
+GRAPH_TOKEN_MAX_429_RETRIES = 3
+
 
 def resolve_socks_proxy_auth(
     username: Optional[str],
@@ -413,6 +416,39 @@ def is_graph_token_scope_retryable_response(response) -> bool:
     ))
 
 
+def _post_token_with_429_backoff(url: str, data: Dict[str, Any], *, proxy_url: str = None,
+                                  fallback_proxy_urls: Optional[List[str]] = None):
+    """POST token 端点；遇到 429 按 Retry-After（回退 2→4→8s）退避重试，最多 GRAPH_TOKEN_MAX_429_RETRIES 次。
+
+    超过最大重试次数仍为 429 时，返回最后一次 429 响应由调用方决定如何处理。
+    """
+    response = post_with_proxy_fallback(
+        url,
+        data=data,
+        timeout=HTTP_REQUEST_TIMEOUT,
+        proxy_url=proxy_url,
+        fallback_proxy_urls=fallback_proxy_urls,
+    )
+    for attempt in range(GRAPH_TOKEN_MAX_429_RETRIES):
+        if response.status_code != 429:
+            return response
+        retry_after = response.headers.get("Retry-After") if getattr(response, "headers", None) else None
+        try:
+            delay = float(retry_after) if retry_after is not None else float(2 ** (attempt + 1))
+        except (TypeError, ValueError):
+            delay = float(2 ** (attempt + 1))
+        delay = min(delay, 8.0)
+        time.sleep(delay)
+        response = post_with_proxy_fallback(
+            url,
+            data=data,
+            timeout=HTTP_REQUEST_TIMEOUT,
+            proxy_url=proxy_url,
+            fallback_proxy_urls=fallback_proxy_urls,
+        )
+    return response
+
+
 def request_graph_token_response(client_id: str, refresh_token: str, proxy_url: str = None,
                                  fallback_proxy_urls: Optional[List[str]] = None,
                                  include_original_scope_fallback: bool = False):
@@ -428,10 +464,9 @@ def request_graph_token_response(client_id: str, refresh_token: str, proxy_url: 
         if scope:
             data["scope"] = scope
 
-        response = post_with_proxy_fallback(
+        response = _post_token_with_429_backoff(
             TOKEN_URL_GRAPH,
-            data=data,
-            timeout=HTTP_REQUEST_TIMEOUT,
+            data,
             proxy_url=proxy_url,
             fallback_proxy_urls=fallback_proxy_urls,
         )
@@ -985,15 +1020,14 @@ IMAP_TOKEN_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All offline_acc
 
 def request_imap_token_response(client_id: str, refresh_token: str, proxy_url: str = None,
                                 fallback_proxy_urls: Optional[List[str]] = None):
-    return post_with_proxy_fallback(
+    return _post_token_with_429_backoff(
         TOKEN_URL_IMAP,
-        data={
+        {
             "client_id": client_id,
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
             "scope": IMAP_TOKEN_SCOPE
         },
-        timeout=HTTP_REQUEST_TIMEOUT,
         proxy_url=proxy_url,
         fallback_proxy_urls=fallback_proxy_urls,
     )

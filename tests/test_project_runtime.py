@@ -3090,6 +3090,42 @@ class DesktopPackagedRuntimeTests(unittest.TestCase):
             'stop',
         ])
 
+
+class GraphTokenRetryTests(unittest.TestCase):
+    """token 刷新 429 退避重试：429 后读 Retry-After 并重试，上限 3 次。"""
+
+    def _make_response(self, status_code, payload=None, headers=None):
+        return types.SimpleNamespace(
+            status_code=status_code,
+            headers=headers or {},
+            json=lambda: payload if payload is not None else {},
+            text="",
+            reason="",
+        )
+
+    @patch("web_outlook_app.time.sleep")
+    @patch("web_outlook_app.post_with_proxy_fallback")
+    def test_graph_token_retries_on_429_then_succeeds(self, mock_post, _mock_sleep):
+        mock_post.side_effect = [
+            self._make_response(429, {"error": "rate_limited"}, headers={"Retry-After": "0"}),
+            self._make_response(200, {"access_token": "abc", "refresh_token": "rt"}),
+        ]
+        response = web_outlook_app.request_graph_token_response("cid", "rt")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_post.call_count, 2)
+
+    @patch("web_outlook_app.time.sleep")
+    @patch("web_outlook_app.post_with_proxy_fallback")
+    def test_graph_token_gives_up_after_max_429(self, mock_post, _mock_sleep):
+        mock_post.side_effect = [
+            self._make_response(429, {"error": "rate_limited"}, headers={"Retry-After": "0"})
+            for _ in range(4)
+        ]
+        response = web_outlook_app.request_graph_token_response("cid", "rt")
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(mock_post.call_count, 4)
+
+
 class SchedulerTimezoneMigrationTests(unittest.TestCase):
     def setUp(self):
         self.app = web_outlook_app.app
