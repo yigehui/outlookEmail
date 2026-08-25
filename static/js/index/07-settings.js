@@ -34,6 +34,13 @@
             }
         }
 
+        function syncRefreshExecutionModeUI() {
+            const modeEl = document.getElementById('refreshExecutionMode');
+            const workersEl = document.getElementById('refreshParallelWorkers');
+            if (!modeEl || !workersEl) return;
+            workersEl.disabled = modeEl.value !== 'parallel';
+        }
+
         function formatStorageBytes(bytes) {
             const value = Number(bytes) || 0;
             if (value < 1024) return `${value} B`;
@@ -1807,6 +1814,8 @@
                     document.getElementById('refreshDelaySeconds').value = data.settings.refresh_delay_seconds || '5';
                     document.getElementById('refreshCron').value = data.settings.refresh_cron || '0 2 * * *';
                     document.getElementById('enableScheduledRefresh').checked = data.settings.enable_scheduled_refresh !== 'false';
+                    document.getElementById('refreshExecutionMode').value = data.settings.refresh_execution_mode === 'parallel' ? 'parallel' : 'serial';
+                    document.getElementById('refreshParallelWorkers').value = data.settings.refresh_parallel_workers || '5';
                     const mailFetchTimeoutSeconds = data.settings.mail_fetch_timeout_seconds || '120';
                     document.getElementById('mailFetchTimeoutSeconds').value = mailFetchTimeoutSeconds;
                     setMailFetchTimeoutSeconds(mailFetchTimeoutSeconds);
@@ -1852,6 +1861,7 @@
                     toggleRefreshStrategy();
                     syncSmtpProviderUI(false);
                     syncForwardExecutionModeUI();
+                    syncRefreshExecutionModeUI();
                     await loadCloudflareChannelsForSettings();
                     await loadNormalMailRetentionStatus();
                 }
@@ -1914,6 +1924,8 @@
             const forwardSeconds = parseInt(document.getElementById('forwardCheckIntervalSeconds').value || '300', 10);
             const forwardExecutionMode = document.getElementById('forwardExecutionMode')?.value === 'parallel' ? 'parallel' : 'serial';
             const forwardParallelWorkers = parseInt(document.getElementById('forwardParallelWorkers').value || '4', 10);
+            const refreshExecutionMode = document.getElementById('refreshExecutionMode')?.value === 'parallel' ? 'parallel' : 'serial';
+            const refreshParallelWorkers = parseInt(document.getElementById('refreshParallelWorkers').value || '5', 10);
             const forwardAccountDelaySeconds = forwardExecutionMode === 'parallel'
                 ? 0
                 : parseInt(document.getElementById('forwardAccountDelaySeconds').value || '0', 10);
@@ -1961,6 +1973,14 @@
             }
             if (Number.isNaN(forwardParallelWorkers) || forwardParallelWorkers < 1 || forwardParallelWorkers > 10) {
                 showToast('转发并行 worker 数必须在 1-10 之间', 'error');
+                return;
+            }
+            if (!['serial', 'parallel'].includes(refreshExecutionMode)) {
+                showToast('刷新执行模式无效', 'error');
+                return;
+            }
+            if (Number.isNaN(refreshParallelWorkers) || refreshParallelWorkers < 1 || refreshParallelWorkers > 20) {
+                showToast('刷新并行 worker 数必须在 1-20 之间', 'error');
                 return;
             }
             if (Number.isNaN(forwardAccountDelaySeconds) || forwardAccountDelaySeconds < 0 || forwardAccountDelaySeconds > 60) {
@@ -2032,6 +2052,8 @@
 
             settings.refresh_interval_days = days;
             settings.refresh_delay_seconds = delay;
+            settings.refresh_execution_mode = refreshExecutionMode;
+            settings.refresh_parallel_workers = refreshParallelWorkers;
             settings.use_cron_schedule = strategy === 'cron';
             settings.enable_scheduled_refresh = enableScheduled;
             settings.app_timezone = appTimeZone;

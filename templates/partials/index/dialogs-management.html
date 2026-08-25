@@ -253,6 +253,25 @@
                                 <div id="cronValidationResult" class="settings-note" style="display: none;"></div>
                             </div>
                         </div>
+
+                        <div class="settings-panel-grid settings-panel-grid--compact">
+                            <div class="form-group">
+                                <label class="form-label">执行模式</label>
+                                <select class="form-select" id="refreshExecutionMode" onchange="syncRefreshExecutionModeUI()">
+                                    <option value="serial">串行</option>
+                                    <option value="parallel">并行</option>
+                                </select>
+                                <div class="form-hint">并行会同时刷新多个账号，默认并行更快；串行更保守。</div>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">并行 worker</label>
+                                <div class="input-inline">
+                                    <input type="number" class="form-input" id="refreshParallelWorkers" min="1" max="20" value="5">
+                                    <span>个</span>
+                                </div>
+                                <div class="form-hint">仅并行模式生效，1-20。</div>
+                            </div>
+                        </div>
                     </div>
                 </section>
 
