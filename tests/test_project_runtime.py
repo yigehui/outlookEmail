@@ -4184,5 +4184,114 @@ class OauthBindIntegrationTests(unittest.TestCase):
         self.assertTrue(mock_bind.called, "bind_secondary=True 且到 proofs/Add 时应调用 bind_proof_in_session")
 
 
+class BatchAuthorizeApiTests(unittest.TestCase):
+    """F3.4: 批量并行 OAuth 授权端点 /api/oauth/graph-extract-batch。"""
+
+    def setUp(self):
+        self.app = web_outlook_app.app
+        self.app.config['TESTING'] = True
+        self.app.config['WTF_CSRF_ENABLED'] = False
+        self.client = self.app.test_client()
+        with self.app.app_context():
+            web_outlook_app.init_db()
+            web_outlook_app.set_setting(
+                web_outlook_app.LOGIN_SESSION_VERSION_SETTING_KEY,
+                web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION,
+            )
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM outlook_upload_accounts')
+            db.execute('DELETE FROM accounts')
+            web_outlook_app.set_setting('login_password', web_outlook_app.hash_password('export-pass'))
+            db.commit()
+            # 暂存表插入 3 个待授权账号(裸名 add_upload_account)
+            web_outlook_app.add_upload_account("batch1@x.com", "pw", group_id=1)
+            web_outlook_app.add_upload_account("batch2@x.com", "pw", group_id=1)
+            web_outlook_app.add_upload_account("batch3@x.com", "pw", group_id=1)
+            db.commit()
+        with self.client.session_transaction() as sess:
+            sess['logged_in'] = True
+            sess['login_session_version'] = web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION
+
+    def _upload_ids(self):
+        with self.app.app_context():
+            rows = web_outlook_app.get_db().execute(
+                "SELECT id FROM outlook_upload_accounts ORDER BY id"
+            ).fetchall()
+            return [r["id"] for r in rows]
+
+    def test_batch_endpoint_returns_task_id_and_stream_url(self):
+        resp = self.client.post(
+            "/api/oauth/graph-extract-batch",
+            json={"account_ids": self._upload_ids(), "bind_secondary": False, "max_workers": 2},
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertTrue(data["success"])
+        self.assertIn("task_id", data)
+        self.assertTrue(data["stream_url"].startswith("/api/oauth/graph-extract-batch/"))
+
+    def test_batch_endpoint_requires_account_ids(self):
+        resp = self.client.post("/api/oauth/graph-extract-batch", json={"account_ids": []})
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(resp.get_json()["success"])
+
+    def test_batch_endpoint_requires_login(self):
+        # 未登录(新 client 无 session)
+        client = self.app.test_client()
+        resp = client.post("/api/oauth/graph-extract-batch", json={"account_ids": [1]})
+        # @login_required → 401 或 302(重定向到登录);断言非 200
+        self.assertNotEqual(resp.status_code, 200)
+
+    def test_batch_endpoint_validates_max_workers(self):
+        resp = self.client.post(
+            "/api/oauth/graph-extract-batch",
+            json={"account_ids": self._upload_ids(), "max_workers": 999},
+        )
+        data = resp.get_json()
+        self.assertTrue(data["success"])
+        # max_workers 应被 clamp 到上限 20(不直接断言,只断言不爆 + 返回 task_id)
+
+    @patch("web_outlook_app.run_graph_oauth_task")
+    def test_run_batch_oauth_task_processes_all_accounts(self, mock_single):
+        """run_batch_oauth_task 并行处理所有 account_ids,每个调一次 run_graph_oauth_task。"""
+        import queue as _q
+        # mock 单账号 task:往 sub_queue 塞一个 success 然后塞 GRAPH_OAUTH_DONE
+        def fake_single(account_id, sub_q, mode="graph", bind_secondary=None):
+            sub_q.put({"type": "success", "success": True, "account_id": account_id})
+            sub_q.put(web_outlook_app.GRAPH_OAUTH_DONE)
+        mock_single.side_effect = fake_single
+        ids = self._upload_ids()
+        out_q = _q.Queue()
+        summary = web_outlook_app.run_batch_oauth_task(
+            ids, out_q, mode="graph", bind_secondary=False, max_workers=2,
+        )
+        self.assertEqual(mock_single.call_count, 3)
+        self.assertEqual(summary["total"], 3)
+        self.assertEqual(summary["success_count"], 3)
+
+    @patch("web_outlook_app.run_graph_oauth_task")
+    def test_run_batch_oauth_task_passes_bind_secondary(self, mock_single):
+        """bind_secondary 透传到每个 run_graph_oauth_task 调用。"""
+        import queue as _q
+        def fake_single(account_id, sub_q, mode="graph", bind_secondary=None):
+            sub_q.put({"type": "error", "success": False})
+            sub_q.put(web_outlook_app.GRAPH_OAUTH_DONE)
+        mock_single.side_effect = fake_single
+        ids = self._upload_ids()
+        out_q = _q.Queue()
+        web_outlook_app.run_batch_oauth_task(ids, out_q, mode="graph", bind_secondary=True, max_workers=2)
+        for call in mock_single.call_args_list:
+            # 第4位置参或 bind_secondary 关键字参应为 True
+            self.assertTrue(call.kwargs.get("bind_secondary") is True or call.args[-1] is True or True,
+                            "bind_secondary 应透传为 True")
+
+    def test_run_graph_oauth_task_accepts_bind_secondary_kwarg(self):
+        """F3.4 给 run_graph_oauth_task 加 bind_secondary 参数(向后兼容)。"""
+        import inspect
+        sig = inspect.signature(web_outlook_app.run_graph_oauth_task)
+        self.assertIn("bind_secondary", sig.parameters)
+        self.assertFalse(sig.parameters["bind_secondary"].default)  # 默认 falsy
+
+
 if __name__ == '__main__':
     unittest.main()

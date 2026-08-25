@@ -7,6 +7,7 @@ import re
 import threading
 import urllib.parse
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 from flask import stream_with_context
@@ -575,7 +576,7 @@ def save_graph_authorization_result(upload_row: Any, client_id: str,
 
 
 def run_graph_oauth_task(account_id: int, output_queue: "queue.Queue[Dict[str, Any] | object]",
-                         mode: str = "graph") -> None:
+                         mode: str = "graph", bind_secondary: Any = None) -> None:
     def emit(payload: Dict[str, Any]) -> None:
         output_queue.put(payload)
 
@@ -619,6 +620,7 @@ def run_graph_oauth_task(account_id: int, output_queue: "queue.Queue[Dict[str, A
                 scope=scope,
                 log=log,
                 proxy_url=auth_proxy_url,
+                bind_secondary=bind_secondary,
             )
             if not result.get("success"):
                 emit({
@@ -697,6 +699,91 @@ def run_graph_oauth_task(account_id: int, output_queue: "queue.Queue[Dict[str, A
             output_queue.put(GRAPH_OAUTH_DONE)
 
 
+def run_batch_oauth_task(account_ids, output_queue, *, mode="graph", bind_secondary=False, max_workers=5):
+    """并行复用单账号 run_graph_oauth_task 处理一批上传账号。
+
+    每个账号起一个子 queue 收集单账号 task 的 SSE 载荷,捕获最后一个 success/error
+    payload 作为该账号的结果;逐 future 回调进度,结束后发 complete 汇总到
+    output_queue,并返回汇总 dict。单账号失败不阻断整批。
+    """
+    total = len(account_ids)
+    output_queue.put({
+        "type": "start",
+        "total": total,
+        "mode": normalize_graph_oauth_mode(mode),
+        "bind_secondary": bool(bind_secondary),
+    })
+
+    def _do_one(account_id):
+        sub_q: "queue.Queue[Dict[str, Any] | object]" = queue.Queue()
+        last_payload: Dict[str, Any] = {"type": "error", "success": False, "account_id": account_id}
+        try:
+            run_graph_oauth_task(account_id, sub_q, mode=mode, bind_secondary=bind_secondary)
+            while True:
+                payload = sub_q.get()
+                if payload is GRAPH_OAUTH_DONE:
+                    break
+                if isinstance(payload, dict):
+                    last_payload = payload
+        except Exception as exc:
+            last_payload = {
+                "type": "error",
+                "success": False,
+                "account_id": account_id,
+                "message": graph_oauth_safe_details(str(exc)),
+            }
+        return account_id, last_payload
+
+    if not account_ids:
+        summary = {"total": 0, "success_count": 0, "failed": []}
+        output_queue.put({"type": "complete", **summary})
+        return summary
+
+    workers = min(max(1, max_workers), len(account_ids))
+    workers = min(workers, 20)
+    completed_index = 0
+    success_count = 0
+    failed: list = []
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='oauth-batch') as executor:
+        future_map = {executor.submit(_do_one, aid): aid for aid in account_ids}
+        for future in as_completed(future_map):
+            account_id = future_map[future]
+            completed_index += 1
+            try:
+                aid, result = future.result()
+            except Exception as exc:
+                aid = account_id
+                result = {
+                    "type": "error",
+                    "success": False,
+                    "account_id": account_id,
+                    "message": graph_oauth_safe_details(str(exc)),
+                }
+            is_success = bool(result.get("success")) if isinstance(result, dict) else False
+            if is_success:
+                success_count += 1
+            else:
+                failed.append({
+                    "account_id": aid,
+                    "error": graph_oauth_safe_details(
+                        str(result.get("message") or result.get("error") or "")
+                        if isinstance(result, dict) else "未知错误"
+                    ),
+                })
+            output_queue.put({
+                "type": "progress",
+                "index": completed_index,
+                "total": total,
+                "account_id": aid,
+                "success": is_success,
+            })
+
+    summary = {"total": total, "success_count": success_count, "failed": failed}
+    output_queue.put({"type": "complete", **summary})
+    return summary
+
+
 @app.route('/api/oauth/graph-extract-token', methods=['POST'])
 @login_required
 def api_graph_extract_token():
@@ -750,6 +837,80 @@ def api_graph_extract_token_stream(task_id: str):
             if payload is GRAPH_OAUTH_DONE:
                 break
             yield graph_oauth_sse(payload)
+        worker.join(timeout=1)
+
+    return Response(stream_with_context(generate()), mimetype='text/event-stream')
+
+
+@app.route('/api/oauth/graph-extract-batch', methods=['POST'])
+@login_required
+def api_graph_extract_batch():
+    data = request.get_json(silent=True) or {}
+    account_ids = data.get('account_ids') or []
+    if not isinstance(account_ids, list) or not account_ids:
+        return jsonify({'success': False, 'error': 'account_ids 不能为空'}), 400
+    try:
+        account_ids = [int(aid) for aid in account_ids]
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'account_ids 包含非法值'}), 400
+    mode = normalize_graph_oauth_mode(data.get('mode'))
+    # 默认 True(符合设计:批量授权自动分配 CF 辅助邮箱);显式传 False 可关闭
+    bind_secondary = bool(data.get('bind_secondary', True))
+    try:
+        max_workers = min(20, max(1, int(data.get('max_workers', 5))))
+    except (TypeError, ValueError):
+        max_workers = 5
+    task_id = uuid.uuid4().hex
+    GRAPH_OAUTH_TASKS[task_id] = {
+        'account_ids': account_ids,
+        'mode': mode,
+        'bind_secondary': bind_secondary,
+        'max_workers': max_workers,
+    }
+    return jsonify({
+        'success': True,
+        'task_id': task_id,
+        'stream_url': f'/api/oauth/graph-extract-batch/{task_id}/stream',
+    })
+
+
+@app.route('/api/oauth/graph-extract-batch/<task_id>/stream')
+@login_required
+def api_graph_extract_batch_stream(task_id: str):
+    task = GRAPH_OAUTH_TASKS.pop(task_id, None)
+    if not task:
+        return Response(
+            graph_oauth_sse({'type': 'error', 'success': False, 'message': '任务不存在或已完成'})
+            + graph_oauth_sse({'type': 'complete', 'success': False}),
+            mimetype='text/event-stream',
+        )
+
+    def generate():
+        out_q: "queue.Queue[Dict[str, Any] | object]" = queue.Queue()
+        worker = threading.Thread(
+            target=run_batch_oauth_task,
+            args=(task['account_ids'], out_q),
+            kwargs={
+                'mode': task['mode'],
+                'bind_secondary': task['bind_secondary'],
+                'max_workers': task['max_workers'],
+            },
+            name=f"oauth-batch-{task_id[:8]}",
+            daemon=True,
+        )
+        worker.start()
+
+        while True:
+            try:
+                payload = out_q.get(timeout=120)
+            except queue.Empty:
+                yield graph_oauth_sse({'type': 'ping'})
+                continue
+            if payload is GRAPH_OAUTH_DONE:
+                break
+            yield graph_oauth_sse(payload)
+            if isinstance(payload, dict) and payload.get('type') == 'complete':
+                break
         worker.join(timeout=1)
 
     return Response(stream_with_context(generate()), mimetype='text/event-stream')
