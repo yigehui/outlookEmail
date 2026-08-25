@@ -389,5 +389,6 @@ def _selftest():
     print(f"JWT 校验(/api/settings): {r.status_code} {r.text[:120]}")
 
 
-if __name__ == "__main__":
-    _selftest()
+    # 自检需在应用上下文内手动调用，不在 segment 加载阶段自动触发
+    # （segment 经 exec 加载，__name__ 始终为 __main__，__main__ 保护会误触发）
+
