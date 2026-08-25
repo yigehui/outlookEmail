@@ -7,6 +7,7 @@ import re
 import threading
 import urllib.parse
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 from flask import stream_with_context
@@ -131,8 +132,16 @@ def extract_graph_refresh_token(
     log: Optional[Callable[[str], None]] = None,
     session_factory: Optional[Callable[[], Any]] = None,
     proxy_url: str = None,
+    bind_secondary: Any = None,
 ) -> Dict[str, Any]:
-    """使用纯 HTTP OAuth2 授权码流程提取 Outlook refresh_token。"""
+    """使用纯 HTTP OAuth2 授权码流程提取 Outlook refresh_token。
+
+    bind_secondary 真值时,流程到达 proofs/Add 会尝试绑定 CF 辅助邮箱
+    (create_or_get_address + bind_proof_in_session),成功后 recovery_email/
+    recovery_email_password 随成功 dict 返回,由调用方透传给 upsert。
+    """
+    _pending_recovery_email = ""
+    _pending_recovery_password = ""
     try:
         session = session_factory() if session_factory else requests.Session()
         resolved_proxy = str(proxy_url or '').strip()
@@ -317,6 +326,29 @@ def extract_graph_refresh_token(
                 continue
 
             if "proofs/Add" in current_url or "proofs/add" in current_url:
+                if bind_secondary:
+                    try:
+                        cf_info = create_or_get_address(email)
+                        cf_address = cf_info.get("address")
+                        cf_jwt = cf_info.get("jwt")
+                        cf_pw = cf_info.get("password") or ""
+                        use_admin = cf_info.get("use_admin", False)
+                    except Exception as exc:
+                        graph_oauth_log(log, f"CF 辅助邮箱分配失败，回退 Skip: {exc}")
+                        cf_address = None
+                    if cf_address:
+                        bound_resp = bind_proof_in_session(
+                            session, text, current_url,
+                            cf_address=cf_address, cf_jwt=cf_jwt,
+                            use_admin=use_admin, idx=0,
+                        )
+                        if bound_resp is not None:
+                            resp2 = bound_resp
+                            _pending_recovery_email = cf_address
+                            _pending_recovery_password = cf_pw
+                            continue
+                        graph_oauth_log(log, "bind 失败，回退 Skip proofs/Add")
+                # 回退 / 未启用绑定：原 Skip 逻辑
                 form_match = re.search(
                     r'<form[^>]*action="([^"]+)"[^>]*>(.*?)</form>',
                     text,
@@ -394,6 +426,8 @@ def extract_graph_refresh_token(
             "success": True,
             "refresh_token": refresh_token,
             "client_id": client_id,
+            "recovery_email": _pending_recovery_email,
+            "recovery_email_password": _pending_recovery_password,
         }
     except Exception as exc:
         return make_graph_oauth_response(False, f"异常: {type(exc).__name__}", str(exc))
@@ -417,7 +451,9 @@ def upsert_graph_authorized_account(email: str, password: str, client_id: str,
                                     proxy_url: str = '',
                                     tag_ids: Any = None,
                                     remark: str = '',
-                                    authorization_type: Optional[str] = None) -> Dict[str, Any]:
+                                    authorization_type: Optional[str] = None,
+                                    recovery_email: str = '',
+                                    recovery_email_password: str = '') -> Dict[str, Any]:
     db = get_db()
     existing = db.execute(
         'SELECT id, authorization_type FROM accounts WHERE LOWER(email) = ? LIMIT 1',
@@ -425,6 +461,7 @@ def upsert_graph_authorized_account(email: str, password: str, client_id: str,
     ).fetchone()
     encrypted_password = encrypt_data(password) if password else password
     encrypted_refresh_token = encrypt_data(refresh_token) if refresh_token else refresh_token
+    encrypted_recovery_password = encrypt_data(recovery_email_password) if recovery_email_password else recovery_email_password
     if authorization_type is None:
         normalized_authorization_type = normalize_outlook_authorization_type(
             existing['authorization_type'] if existing else ''
@@ -447,13 +484,16 @@ def upsert_graph_authorized_account(email: str, password: str, client_id: str,
                 account_type = 'outlook',
                 provider = 'outlook',
                 authorization_type = ?,
+                recovery_email = ?,
+                recovery_email_password = ?,
                 refresh_token_updated_at = CURRENT_TIMESTAMP,
                 last_refresh_status = 'never',
                 last_refresh_error = NULL,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             ''',
-            (encrypted_password, client_id, encrypted_refresh_token, normalized_authorization_type, account_id),
+            (encrypted_password, client_id, encrypted_refresh_token, normalized_authorization_type,
+             recovery_email, encrypted_recovery_password, account_id),
         )
         return {"account_id": account_id, "created": False}
 
@@ -477,6 +517,8 @@ def upsert_graph_authorized_account(email: str, password: str, client_id: str,
         normalized_proxy,
         '',
         '',
+        recovery_email,
+        recovery_email_password,
     ))
     account_id = int(cursor.lastrowid)
     apply_account_tag_ids(account_id, tag_ids, db)
@@ -509,7 +551,9 @@ def mark_upload_account_authorized(account_id: int) -> None:
 
 def save_graph_authorization_result(upload_row: Any, client_id: str,
                                     refresh_token: str,
-                                    authorization_type: Optional[str] = None) -> Dict[str, Any]:
+                                    authorization_type: Optional[str] = None,
+                                    recovery_email: str = '',
+                                    recovery_email_password: str = '') -> Dict[str, Any]:
     email = str(upload_row['email'] or '').strip()
     password = get_upload_account_plain_password(upload_row)
     row_data = dict(upload_row) if hasattr(upload_row, 'keys') else {}
@@ -523,6 +567,8 @@ def save_graph_authorization_result(upload_row: Any, client_id: str,
         tag_ids=decode_upload_tag_ids(row_data.get('tag_ids')),
         remark=str(row_data.get('remark') or ''),
         authorization_type=authorization_type,
+        recovery_email=recovery_email,
+        recovery_email_password=recovery_email_password,
     )
     mark_upload_account_authorized(int(upload_row['id']))
     get_db().commit()
@@ -530,7 +576,7 @@ def save_graph_authorization_result(upload_row: Any, client_id: str,
 
 
 def run_graph_oauth_task(account_id: int, output_queue: "queue.Queue[Dict[str, Any] | object]",
-                         mode: str = "graph") -> None:
+                         mode: str = "graph", bind_secondary: Any = None) -> None:
     def emit(payload: Dict[str, Any]) -> None:
         output_queue.put(payload)
 
@@ -574,6 +620,7 @@ def run_graph_oauth_task(account_id: int, output_queue: "queue.Queue[Dict[str, A
                 scope=scope,
                 log=log,
                 proxy_url=auth_proxy_url,
+                bind_secondary=bind_secondary,
             )
             if not result.get("success"):
                 emit({
@@ -613,11 +660,15 @@ def run_graph_oauth_task(account_id: int, output_queue: "queue.Queue[Dict[str, A
                 return
 
             token_to_save = rotated_refresh_token or refresh_token
+            recovery_email = str(result.get("recovery_email") or "")
+            recovery_email_password = str(result.get("recovery_email_password") or "")
             save_result = save_graph_authorization_result(
                 upload_row,
                 client_id,
                 token_to_save,
                 authorization_type=actual_channel or mode,
+                recovery_email=recovery_email,
+                recovery_email_password=recovery_email_password,
             )
             emit({
                 "type": "success",
@@ -646,6 +697,91 @@ def run_graph_oauth_task(account_id: int, output_queue: "queue.Queue[Dict[str, A
             emit({"type": "complete", "success": False})
         finally:
             output_queue.put(GRAPH_OAUTH_DONE)
+
+
+def run_batch_oauth_task(account_ids, output_queue, *, mode="graph", bind_secondary=False, max_workers=5):
+    """并行复用单账号 run_graph_oauth_task 处理一批上传账号。
+
+    每个账号起一个子 queue 收集单账号 task 的 SSE 载荷,捕获最后一个 success/error
+    payload 作为该账号的结果;逐 future 回调进度,结束后发 complete 汇总到
+    output_queue,并返回汇总 dict。单账号失败不阻断整批。
+    """
+    total = len(account_ids)
+    output_queue.put({
+        "type": "start",
+        "total": total,
+        "mode": normalize_graph_oauth_mode(mode),
+        "bind_secondary": bool(bind_secondary),
+    })
+
+    def _do_one(account_id):
+        sub_q: "queue.Queue[Dict[str, Any] | object]" = queue.Queue()
+        last_payload: Dict[str, Any] = {"type": "error", "success": False, "account_id": account_id}
+        try:
+            run_graph_oauth_task(account_id, sub_q, mode=mode, bind_secondary=bind_secondary)
+            while True:
+                payload = sub_q.get()
+                if payload is GRAPH_OAUTH_DONE:
+                    break
+                if isinstance(payload, dict):
+                    last_payload = payload
+        except Exception as exc:
+            last_payload = {
+                "type": "error",
+                "success": False,
+                "account_id": account_id,
+                "message": graph_oauth_safe_details(str(exc)),
+            }
+        return account_id, last_payload
+
+    if not account_ids:
+        summary = {"total": 0, "success_count": 0, "failed": []}
+        output_queue.put({"type": "complete", **summary})
+        return summary
+
+    workers = min(max(1, max_workers), len(account_ids))
+    workers = min(workers, 20)
+    completed_index = 0
+    success_count = 0
+    failed: list = []
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='oauth-batch') as executor:
+        future_map = {executor.submit(_do_one, aid): aid for aid in account_ids}
+        for future in as_completed(future_map):
+            account_id = future_map[future]
+            completed_index += 1
+            try:
+                aid, result = future.result()
+            except Exception as exc:
+                aid = account_id
+                result = {
+                    "type": "error",
+                    "success": False,
+                    "account_id": account_id,
+                    "message": graph_oauth_safe_details(str(exc)),
+                }
+            is_success = bool(result.get("success")) if isinstance(result, dict) else False
+            if is_success:
+                success_count += 1
+            else:
+                failed.append({
+                    "account_id": aid,
+                    "error": graph_oauth_safe_details(
+                        str(result.get("message") or result.get("error") or "")
+                        if isinstance(result, dict) else "未知错误"
+                    ),
+                })
+            output_queue.put({
+                "type": "progress",
+                "index": completed_index,
+                "total": total,
+                "account_id": aid,
+                "success": is_success,
+            })
+
+    summary = {"total": total, "success_count": success_count, "failed": failed}
+    output_queue.put({"type": "complete", **summary})
+    return summary
 
 
 @app.route('/api/oauth/graph-extract-token', methods=['POST'])
@@ -701,6 +837,80 @@ def api_graph_extract_token_stream(task_id: str):
             if payload is GRAPH_OAUTH_DONE:
                 break
             yield graph_oauth_sse(payload)
+        worker.join(timeout=1)
+
+    return Response(stream_with_context(generate()), mimetype='text/event-stream')
+
+
+@app.route('/api/oauth/graph-extract-batch', methods=['POST'])
+@login_required
+def api_graph_extract_batch():
+    data = request.get_json(silent=True) or {}
+    account_ids = data.get('account_ids') or []
+    if not isinstance(account_ids, list) or not account_ids:
+        return jsonify({'success': False, 'error': 'account_ids 不能为空'}), 400
+    try:
+        account_ids = [int(aid) for aid in account_ids]
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'account_ids 包含非法值'}), 400
+    mode = normalize_graph_oauth_mode(data.get('mode'))
+    # 默认 True(符合设计:批量授权自动分配 CF 辅助邮箱);显式传 False 可关闭
+    bind_secondary = bool(data.get('bind_secondary', True))
+    try:
+        max_workers = min(20, max(1, int(data.get('max_workers', 5))))
+    except (TypeError, ValueError):
+        max_workers = 5
+    task_id = uuid.uuid4().hex
+    GRAPH_OAUTH_TASKS[task_id] = {
+        'account_ids': account_ids,
+        'mode': mode,
+        'bind_secondary': bind_secondary,
+        'max_workers': max_workers,
+    }
+    return jsonify({
+        'success': True,
+        'task_id': task_id,
+        'stream_url': f'/api/oauth/graph-extract-batch/{task_id}/stream',
+    })
+
+
+@app.route('/api/oauth/graph-extract-batch/<task_id>/stream')
+@login_required
+def api_graph_extract_batch_stream(task_id: str):
+    task = GRAPH_OAUTH_TASKS.pop(task_id, None)
+    if not task:
+        return Response(
+            graph_oauth_sse({'type': 'error', 'success': False, 'message': '任务不存在或已完成'})
+            + graph_oauth_sse({'type': 'complete', 'success': False}),
+            mimetype='text/event-stream',
+        )
+
+    def generate():
+        out_q: "queue.Queue[Dict[str, Any] | object]" = queue.Queue()
+        worker = threading.Thread(
+            target=run_batch_oauth_task,
+            args=(task['account_ids'], out_q),
+            kwargs={
+                'mode': task['mode'],
+                'bind_secondary': task['bind_secondary'],
+                'max_workers': task['max_workers'],
+            },
+            name=f"oauth-batch-{task_id[:8]}",
+            daemon=True,
+        )
+        worker.start()
+
+        while True:
+            try:
+                payload = out_q.get(timeout=120)
+            except queue.Empty:
+                yield graph_oauth_sse({'type': 'ping'})
+                continue
+            if payload is GRAPH_OAUTH_DONE:
+                break
+            yield graph_oauth_sse(payload)
+            if isinstance(payload, dict) and payload.get('type') == 'complete':
+                break
         worker.join(timeout=1)
 
     return Response(stream_with_context(generate()), mimetype='text/event-stream')

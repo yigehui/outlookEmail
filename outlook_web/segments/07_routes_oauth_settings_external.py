@@ -763,6 +763,28 @@ def api_update_settings():
         except ValueError:
             errors.append('刷新间隔必须是数字')
 
+    # 更新刷新并发度
+    if 'refresh_parallel_workers' in data:
+        try:
+            workers = int(data['refresh_parallel_workers'])
+            workers = max(1, min(20, workers))
+            if set_setting('refresh_parallel_workers', str(workers)):
+                updated.append('刷新并发度')
+            else:
+                errors.append('更新刷新并发度失败')
+        except (TypeError, ValueError):
+            errors.append('刷新并发度必须是数字')
+
+    # 更新刷新执行模式
+    if 'refresh_execution_mode' in data:
+        mode = str(data.get('refresh_execution_mode') or '').strip()
+        if mode not in ('serial', 'parallel'):
+            errors.append('刷新执行模式必须为 serial 或 parallel')
+        elif set_setting('refresh_execution_mode', mode):
+            updated.append('刷新执行模式')
+        else:
+            errors.append('更新刷新执行模式失败')
+
     # 更新 Cron 表达式
     if 'refresh_cron' in data:
         cron_expr = data['refresh_cron'].strip()
@@ -1416,6 +1438,67 @@ def api_external_upload_outlook():
 
     summary = add_upload_accounts_bulk(items)
     return jsonify({'success': True, **summary})
+
+
+@app.route('/api/external/accounts/import', methods=['POST'])
+@csrf_exempt
+@api_key_required
+def api_external_import_accounts():
+    """对外 API：通过 API Key 将多行账号文本导入主 accounts 表。
+
+    复用 POST /api/accounts 的解析与批量写入管道（parse_account_import → add_accounts_bulk），
+    支持 6 段（含辅助邮箱）与 4 段兼容；写入主 accounts 表，不写暂存表。
+    """
+    data = request.get_json(silent=True) or {}
+    account_str = data.get('account_string', '')
+    if not account_str or not account_str.strip():
+        return jsonify({'success': False, 'error': '请输入账号信息'}), 400
+
+    group_id = data.get('group_id', 1)
+    account_format = data.get('account_format', 'client_id_refresh_token')
+    provider = data.get('provider', 'outlook')
+    imap_host = (data.get('imap_host', '') or '').strip()
+    try:
+        imap_port = int(data.get('imap_port', 993) or 993)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'IMAP 端口无效'}), 400
+    tag_ids = data.get('tag_ids', [])
+    proxy_url = str(data.get('proxy_url', '') or '').strip()
+    fallback_proxy_url_1 = str(data.get('fallback_proxy_url_1', '') or '').strip()
+    fallback_proxy_url_2 = str(data.get('fallback_proxy_url_2', '') or '').strip()
+    forward_enabled = bool(data.get('forward_enabled', False))
+    sort_order = None
+    remark = ''
+    status = 'active'
+
+    lines = account_str.strip().split('\n')
+    parsed_accounts = []
+    invalid_count = 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        parsed = parse_account_import(line, account_format, provider, imap_host, imap_port)
+        if parsed:
+            parsed_accounts.append(parsed)
+        else:
+            invalid_count += 1
+
+    result = add_accounts_bulk(
+        parsed_accounts, group_id, forward_enabled, sort_order,
+        remark, status, tag_ids, proxy_url, fallback_proxy_url_1, fallback_proxy_url_2,
+    )
+    added = result.get('added_count', 0)
+    skipped_count = result.get('skipped_count', 0)
+    tagged_count = result.get('tagged_count', 0)
+
+    return jsonify({
+        'success': True,
+        'added_count': added,
+        'skipped_count': skipped_count,
+        'invalid_count': invalid_count,
+        'tagged_count': tagged_count,
+    })
 
 
 @app.route('/api/outlook-upload-accounts', methods=['GET'])

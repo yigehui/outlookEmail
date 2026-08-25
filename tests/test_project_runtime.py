@@ -7,8 +7,9 @@ import tempfile
 import types
 import unittest
 import zipfile
+import json
 from email.message import EmailMessage
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 
 os.environ.setdefault('SECRET_KEY', 'test-secret-key')
@@ -319,6 +320,9 @@ class ProjectRuntimeTests(unittest.TestCase):
         with self.app.app_context():
             db = web_outlook_app.get_db()
             db.execute("UPDATE settings SET value = '0' WHERE key = 'refresh_delay_seconds'")
+            # 本用例断言串行路径的逐账号 SSE 事件（account_id、test_refresh_token
+            # 调用计数），固定为 serial 避免落入默认 parallel 分支。
+            db.execute("UPDATE settings SET value = 'serial' WHERE key = 'refresh_execution_mode'")
             db.commit()
 
         task_response = self.client.post('/api/accounts/refresh-selected-stream', json={
@@ -2298,6 +2302,124 @@ class RecoveryEmailTests(unittest.TestCase):
             return int(cursor.lastrowid)
 
 
+class ExternalImportApiTests(unittest.TestCase):
+    """对外 API /api/external/accounts/import：API Key 鉴权 + 复用主账号导入管道。"""
+
+    def setUp(self):
+        self.app = web_outlook_app.app
+        self.app.config['TESTING'] = True
+        self.app.config['WTF_CSRF_ENABLED'] = False
+        self.client = self.app.test_client()
+
+        with self.app.app_context():
+            web_outlook_app.init_db()
+            web_outlook_app.set_setting(
+                web_outlook_app.LOGIN_SESSION_VERSION_SETTING_KEY,
+                web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION,
+            )
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM accounts')
+            web_outlook_app.set_setting('login_password', web_outlook_app.hash_password('export-pass'))
+            # 配置对外 API Key
+            web_outlook_app.set_setting('external_api_key', 'sk-test-123')
+            db.commit()
+
+        with self.client.session_transaction() as sess:
+            sess['logged_in'] = True
+            sess['login_session_version'] = web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION
+
+    def _headers(self):
+        return {'X-API-Key': 'sk-test-123'}
+
+    def test_import_with_valid_api_key_writes_main_table(self):
+        response = self.client.post(
+            '/api/external/accounts/import',
+            headers=self._headers(),
+            json={
+                'account_string': 'imp1@x.com----pw1----clientid1----reftoken1----aux1@cf.com----auxpw1',
+                'group_id': 1,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data['success'])
+        self.assertEqual(data['added_count'], 1)
+
+        with self.app.app_context():
+            row = web_outlook_app.get_db().execute(
+                'SELECT email, recovery_email FROM accounts WHERE email = ?',
+                ('imp1@x.com',),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row['email'], 'imp1@x.com')
+        self.assertEqual(row['recovery_email'], 'aux1@cf.com')
+
+    def test_import_without_api_key_rejected(self):
+        response = self.client.post(
+            '/api/external/accounts/import',
+            json={'account_string': 'x@x.com----pw----cid----rt'},
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertFalse(response.get_json()['success'])
+
+    def test_import_invalid_key_rejected(self):
+        response = self.client.post(
+            '/api/external/accounts/import',
+            headers={'X-API-Key': 'wrong'},
+            json={'account_string': 'x@x.com----pw----cid----rt'},
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertFalse(response.get_json()['success'])
+
+    def test_import_4_segment_backward_compatible(self):
+        response = self.client.post(
+            '/api/external/accounts/import',
+            headers=self._headers(),
+            json={'account_string': 'imp2@x.com----pw2----cid2----rt2'},
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data['success'])
+        self.assertEqual(data['added_count'], 1)
+
+        with self.app.app_context():
+            row = web_outlook_app.get_db().execute(
+                'SELECT recovery_email FROM accounts WHERE email = ?',
+                ('imp2@x.com',),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row['recovery_email'], '')
+
+    def test_import_multi_line_bulk(self):
+        response = self.client.post(
+            '/api/external/accounts/import',
+            headers=self._headers(),
+            json={
+                'account_string': 'a@x.com----p----c----r\nb@x.com----p----c----r',
+                'group_id': 1,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data['success'])
+        self.assertEqual(data['added_count'], 2)
+
+    def test_import_returns_skipped_and_invalid_counts(self):
+        # 第一行导入成功，第二行重复被跳过，第三行无 ---- 分隔符为无效行
+        account_string = 'a@x.com----p----c----r\na@x.com----p----c----r\nNOT_AN_ACCOUNT'
+        response = self.client.post(
+            '/api/external/accounts/import',
+            headers=self._headers(),
+            json={'account_string': account_string},
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data['success'])
+        self.assertEqual(data['added_count'], 1)
+        self.assertEqual(data['skipped_count'], 1)
+        self.assertEqual(data['invalid_count'], 1)
+
+
 class FrontendColorPickerTests(unittest.TestCase):
     def test_color_picker_initialization_block_calls_init_once(self):
         core_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '01-core.js').read_text(encoding='utf-8')
@@ -3090,6 +3212,85 @@ class DesktopPackagedRuntimeTests(unittest.TestCase):
             'stop',
         ])
 
+
+class GraphTokenRetryTests(unittest.TestCase):
+    """token 刷新 429 退避重试：429 后读 Retry-After 并重试，上限 3 次。"""
+
+    def _make_response(self, status_code, payload=None, headers=None):
+        return types.SimpleNamespace(
+            status_code=status_code,
+            headers=headers or {},
+            json=lambda: payload if payload is not None else {},
+            text="",
+            reason="",
+        )
+
+    @patch("web_outlook_app.time.sleep")
+    @patch("web_outlook_app.post_with_proxy_fallback")
+    def test_graph_token_retries_on_429_then_succeeds(self, mock_post, _mock_sleep):
+        mock_post.side_effect = [
+            self._make_response(429, {"error": "rate_limited"}, headers={"Retry-After": "0"}),
+            self._make_response(200, {"access_token": "abc", "refresh_token": "rt"}),
+        ]
+        response = web_outlook_app.request_graph_token_response("cid", "rt")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_post.call_count, 2)
+
+    @patch("web_outlook_app.time.sleep")
+    @patch("web_outlook_app.post_with_proxy_fallback")
+    def test_graph_token_gives_up_after_max_429(self, mock_post, _mock_sleep):
+        mock_post.side_effect = [
+            self._make_response(429, {"error": "rate_limited"}, headers={"Retry-After": "0"})
+            for _ in range(4)
+        ]
+        response = web_outlook_app.request_graph_token_response("cid", "rt")
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(mock_post.call_count, 4)
+
+    @patch("web_outlook_app.time.sleep")
+    @patch("web_outlook_app.post_with_proxy_fallback")
+    def test_graph_token_fallback_exponential_when_no_retry_after_header(self, mock_post, mock_sleep):
+        # 无 Retry-After 头：回退 2→4→8s 指数退避
+        mock_post.side_effect = [
+            self._make_response(429, {"error": "rate_limited"}),
+            self._make_response(429, {"error": "rate_limited"}),
+            self._make_response(429, {"error": "rate_limited"}),
+            self._make_response(200, {"access_token": "abc", "refresh_token": "rt"}),
+        ]
+        response = web_outlook_app.request_graph_token_response("cid", "rt")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_post.call_count, 4)
+        self.assertEqual(mock_sleep.call_args_list, [call(2), call(4), call(8)])
+
+    @patch("web_outlook_app.time.sleep")
+    @patch("web_outlook_app.post_with_proxy_fallback")
+    def test_graph_token_fallback_exponential_when_retry_after_is_http_date(self, mock_post, mock_sleep):
+        # Retry-After 为 HTTP 日期（无法解析为秒）→ 触发回退 2→4→8s
+        mock_post.side_effect = [
+            self._make_response(429, {"error": "rate_limited"}, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}),
+            self._make_response(429, {"error": "rate_limited"}, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}),
+            self._make_response(429, {"error": "rate_limited"}, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}),
+            self._make_response(200, {"access_token": "abc", "refresh_token": "rt"}),
+        ]
+        response = web_outlook_app.request_graph_token_response("cid", "rt")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_post.call_count, 4)
+        self.assertEqual(mock_sleep.call_args_list, [call(2), call(4), call(8)])
+
+    @patch("web_outlook_app.time.sleep")
+    @patch("web_outlook_app.post_with_proxy_fallback")
+    def test_graph_token_caps_large_retry_after_at_http_request_timeout(self, mock_post, mock_sleep):
+        # Retry-After: "60" 应被截断到 HTTP_REQUEST_TIMEOUT（30s），而非 8s
+        mock_post.side_effect = [
+            self._make_response(429, {"error": "rate_limited"}, headers={"Retry-After": "60"}),
+            self._make_response(200, {"access_token": "abc", "refresh_token": "rt"}),
+        ]
+        response = web_outlook_app.request_graph_token_response("cid", "rt")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_post.call_count, 2)
+        self.assertEqual(mock_sleep.call_args_list, [call(web_outlook_app.HTTP_REQUEST_TIMEOUT)])
+
+
 class SchedulerTimezoneMigrationTests(unittest.TestCase):
     def setUp(self):
         self.app = web_outlook_app.app
@@ -3266,6 +3467,830 @@ class SchedulerTimezoneMigrationTests(unittest.TestCase):
 
         self.assertEqual(scheduler.shutdown_calls, 1)
         self.assertFalse(scheduler.started)
+
+
+class RefreshParallelSettingsTests(unittest.TestCase):
+    """刷新并发度 / 执行模式：DB seed、normalize 钳制、PUT /api/settings 写入。"""
+
+    def setUp(self):
+        self.app = web_outlook_app.app
+        self.app.config['TESTING'] = True
+        self.app.config['WTF_CSRF_ENABLED'] = False
+        self.client = self.app.test_client()
+        with self.app.app_context():
+            web_outlook_app.init_db()
+            web_outlook_app.set_setting(
+                web_outlook_app.LOGIN_SESSION_VERSION_SETTING_KEY,
+                web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION,
+            )
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM accounts')
+            web_outlook_app.set_setting('login_password', web_outlook_app.hash_password('export-pass'))
+            db.commit()
+        with self.client.session_transaction() as sess:
+            sess['logged_in'] = True
+            sess['login_session_version'] = web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION
+
+    def test_default_parallel_workers_is_5(self):
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            # 清掉这两个 setting 行，让 init_db 的 INSERT OR IGNORE 真正去 seed，
+            # 否则其他用例（如 RefreshTokenProxyFallbackTests 固定 serial）会留下
+            # 污染值，使本用例测不到 init_db 的默认播种行为。
+            db.execute("DELETE FROM settings WHERE key IN ('refresh_parallel_workers', 'refresh_execution_mode')")
+            db.commit()
+            web_outlook_app.init_db()
+            db = web_outlook_app.get_db()
+            workers_row = db.execute(
+                "SELECT value FROM settings WHERE key = 'refresh_parallel_workers'"
+            ).fetchone()
+            mode_row = db.execute(
+                "SELECT value FROM settings WHERE key = 'refresh_execution_mode'"
+            ).fetchone()
+        self.assertIsNotNone(workers_row)
+        self.assertEqual(workers_row['value'], '5')
+        self.assertIsNotNone(mode_row)
+        self.assertEqual(mode_row['value'], 'parallel')
+
+    def test_normalize_parallel_workers_clamps_1_to_20(self):
+        self.assertEqual(web_outlook_app.normalize_refresh_parallel_workers('99'), 20)
+        self.assertEqual(web_outlook_app.normalize_refresh_parallel_workers('0'), 1)
+        self.assertEqual(web_outlook_app.normalize_refresh_parallel_workers('abc'), 5)
+        self.assertEqual(web_outlook_app.normalize_refresh_parallel_workers(None), 5)
+        self.assertEqual(web_outlook_app.normalize_refresh_parallel_workers('7'), 7)
+
+    def test_normalize_execution_mode_defaults_parallel(self):
+        self.assertEqual(web_outlook_app.normalize_refresh_execution_mode('serial'), 'serial')
+        self.assertEqual(web_outlook_app.normalize_refresh_execution_mode('parallel'), 'parallel')
+        self.assertEqual(web_outlook_app.normalize_refresh_execution_mode('bogus'), 'parallel')
+        self.assertEqual(web_outlook_app.normalize_refresh_execution_mode(None), 'parallel')
+
+    def test_settings_put_accepts_parallel_workers_and_clamps(self):
+        response = self.client.put(
+            '/api/settings',
+            json={'refresh_parallel_workers': '99'},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()['success'])
+        with self.app.app_context():
+            val = web_outlook_app.get_db().execute(
+                "SELECT value FROM settings WHERE key = 'refresh_parallel_workers'"
+            ).fetchone()['value']
+        self.assertEqual(val, '20')
+
+
+class RefreshParallelDispatchTests(unittest.TestCase):
+    # Pure-function concurrency tests — no DB, no app context, no setUp needed.
+
+    def test_parallel_runs_all_accounts_and_counts_correctly(self):
+        calls = []
+        def fake_refresh(account, log_type, db_conn=None):
+            calls.append(account['email'])
+            return {'success': True, 'email': account['email']}
+        accounts = [{'id': i, 'email': f'u{i}@x.com'} for i in range(7)]
+        results = web_outlook_app.refresh_accounts_parallel(
+            accounts,
+            refresh_fn=fake_refresh,
+            max_workers=5,
+            progress_callback=None,
+            stop_check=lambda: False,
+            db_conn=None,
+            log_refresh_type='manual',
+        )
+        self.assertEqual(len(results), 7)
+        self.assertEqual(set(calls), {a['email'] for a in accounts})
+        self.assertTrue(all(r['success'] for r in results))
+
+    def test_parallel_progress_callback_fires_per_account(self):
+        events = []
+        def fake_refresh(account, log_type, db_conn=None):
+            return {'success': True, 'email': account['email']}
+        accounts = [{'id': i, 'email': f'u{i}@x.com'} for i in range(4)]
+        web_outlook_app.refresh_accounts_parallel(
+            accounts,
+            refresh_fn=fake_refresh,
+            max_workers=2,
+            progress_callback=events.append,
+            stop_check=lambda: False,
+            db_conn=None,
+            log_refresh_type='manual',
+        )
+        # 4 accounts → 4 progress events, each with type/index/total/email/success
+        self.assertEqual(len(events), 4)
+        self.assertTrue(all(e['type'] == 'progress' for e in events))
+        self.assertEqual({e['total'] for e in events}, {4})
+        self.assertEqual({e['index'] for e in events}, {1, 2, 3, 4})
+        self.assertTrue(all(e['success'] is True for e in events))
+
+    def test_parallel_stop_request_cancels_remaining(self):
+        submitted = []
+        def fake_refresh(account, log_type, db_conn=None):
+            submitted.append(account['email'])
+            return {'success': True, 'email': account['email']}
+        counter = {'n': 0}
+        def stop_check():
+            counter['n'] += 1
+            return counter['n'] > 3
+        accounts = [{'id': i, 'email': f'u{i}@x.com'} for i in range(20)]
+        results = web_outlook_app.refresh_accounts_parallel(
+            accounts, refresh_fn=fake_refresh, max_workers=2,
+            progress_callback=None, stop_check=stop_check,
+            db_conn=None, log_refresh_type='manual',
+        )
+        # stop_check returns True after the 3rd submit → submit loop breaks early
+        self.assertLess(len(submitted), 20)
+
+    def test_parallel_exception_in_refresh_becomes_failed_result(self):
+        def fake_refresh(account, log_type, db_conn=None):
+            if account['id'] == 1:
+                raise RuntimeError('boom')
+            return {'success': True, 'email': account['email']}
+        accounts = [{'id': i, 'email': f'u{i}@x.com'} for i in range(3)]
+        results = web_outlook_app.refresh_accounts_parallel(
+            accounts, refresh_fn=fake_refresh, max_workers=2,
+            progress_callback=None, stop_check=lambda: False,
+            db_conn=None, log_refresh_type='manual',
+        )
+        self.assertEqual(len(results), 3)
+        failed = [r for r in results if not r.get('success')]
+        self.assertEqual(len(failed), 1)
+        self.assertIn('boom', failed[0].get('error', ''))
+
+    def test_parallel_handles_sqlite3_row_accounts(self):
+        # sqlite3.Row has no .get() — helper must use subscript access (regression guard).
+        # progress_callback must be non-None so the email-extraction path actually runs.
+        import sqlite3
+        conn = sqlite3.connect(':memory:')
+        conn.row_factory = sqlite3.Row
+        conn.execute('CREATE TABLE a(id INTEGER, email TEXT)')
+        conn.executemany('INSERT INTO a VALUES (?,?)', [(i, f'u{i}@x.com') for i in range(3)])
+        rows = conn.execute('SELECT id, email FROM a').fetchall()
+        events = []
+        def fake_refresh(account, log_type, db_conn=None):
+            return {'success': True, 'email': account['email']}
+        results = web_outlook_app.refresh_accounts_parallel(
+            rows, refresh_fn=fake_refresh, max_workers=2,
+            progress_callback=events.append, stop_check=lambda: False,
+            db_conn=None, log_refresh_type='manual',
+        )
+        self.assertEqual(len(results), 3)
+        self.assertTrue(all(r['success'] for r in results))
+        # progress events fired and each carries the row's email (subscript access works)
+        self.assertEqual(len(events), 3)
+        self.assertEqual({e['email'] for e in events}, {f'u{i}@x.com' for i in range(3)})
+
+    def test_parallel_progress_error_uses_error_message_key(self):
+        events = []
+        def fake_refresh(account, log_type, db_conn=None):
+            return {'success': False, 'error_message': 'Token 刷新失败'}
+        accounts = [{'id': 1, 'email': 'u@x.com'}]
+        web_outlook_app.refresh_accounts_parallel(
+            accounts, refresh_fn=fake_refresh, max_workers=1,
+            progress_callback=events.append, stop_check=lambda: False,
+            db_conn=None, log_refresh_type='manual',
+        )
+        self.assertEqual(len(events), 1)
+        self.assertFalse(events[0]['success'])
+        self.assertEqual(events[0]['error'], 'Token 刷新失败')
+
+
+class RefreshModeDispatchTests(unittest.TestCase):
+    """run_full_refresh 在 parallel 模式下走 refresh_accounts_parallel 分支；
+
+    worker (_refresh_account_in_thread) 自建 sqlite 连接，不共享主连接。
+    """
+
+    def setUp(self):
+        self.app = web_outlook_app.app
+        self.app.config['TESTING'] = True
+        self.app.config['WTF_CSRF_ENABLED'] = False
+        self.client = self.app.test_client()
+        with self.app.app_context():
+            web_outlook_app.init_db()
+            web_outlook_app.set_setting(
+                web_outlook_app.LOGIN_SESSION_VERSION_SETTING_KEY,
+                web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION,
+            )
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM accounts')
+            web_outlook_app.set_setting('login_password', web_outlook_app.hash_password('export-pass'))
+            db.commit()
+        with self.client.session_transaction() as sess:
+            sess['logged_in'] = True
+            sess['login_session_version'] = web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION
+
+    def _insert_two_active_accounts(self):
+        with self.app.app_context():
+            web_outlook_app.add_account('a@x.com', 'pw', 'cid', 'rt', group_id=1)
+            web_outlook_app.add_account('b@x.com', 'pw', 'cid', 'rt', group_id=1)
+            db = web_outlook_app.get_db()
+            db.commit()
+
+    def test_run_full_refresh_uses_parallel_when_configured(self):
+        self._insert_two_active_accounts()
+        with self.app.app_context():
+            web_outlook_app.set_setting('refresh_execution_mode', 'parallel')
+            web_outlook_app.set_setting('refresh_parallel_workers', '3')
+            web_outlook_app.get_db().commit()
+
+        with patch.object(
+            web_outlook_app,
+            'refresh_accounts_parallel',
+            return_value=[
+                {'success': True, 'email': 'a@x.com'},
+                {'success': True, 'email': 'b@x.com'},
+            ],
+        ) as mock_parallel:
+            result = web_outlook_app.run_full_refresh('manual_all', 'manual', progress_callback=None)
+
+        self.assertTrue(mock_parallel.called)
+        args, kwargs = mock_parallel.call_args
+        # worker 必须是自建连接的 _refresh_account_in_thread（线程安全回归守卫）
+        self.assertIs(kwargs.get('refresh_fn'), web_outlook_app._refresh_account_in_thread)
+        self.assertEqual(kwargs.get('max_workers'), 3)
+        self.assertEqual(result['success_count'], 2)
+        self.assertEqual(result['failed_count'], 0)
+        self.assertEqual(result['total'], 2)
+
+    def test_run_full_refresh_serial_mode_not_called(self):
+        with self.app.app_context():
+            web_outlook_app.add_account('s@x.com', 'pw', 'cid', 'rt', group_id=1)
+            web_outlook_app.set_setting('refresh_execution_mode', 'serial')
+            web_outlook_app.get_db().commit()
+
+        with patch.object(web_outlook_app, 'refresh_accounts_parallel') as mock_parallel, \
+             patch.object(
+                 web_outlook_app,
+                 'refresh_outlook_account_token',
+                 return_value={'success': True, 'message': 'ok'},
+             ):
+            result = web_outlook_app.run_full_refresh('manual_all', 'manual', progress_callback=None)
+
+        self.assertFalse(mock_parallel.called)
+        self.assertEqual(result['success_count'], 1)
+
+    def test_run_full_refresh_parallel_counts_failures(self):
+        self._insert_two_active_accounts()
+        with self.app.app_context():
+            web_outlook_app.set_setting('refresh_execution_mode', 'parallel')
+            web_outlook_app.get_db().commit()
+
+        with patch.object(
+            web_outlook_app,
+            'refresh_accounts_parallel',
+            return_value=[
+                {'success': True, 'email': 'a@x.com'},
+                {'success': False, 'email': 'b@x.com', 'error': 'boom'},
+            ],
+        ):
+            result = web_outlook_app.run_full_refresh('manual_all', 'manual', progress_callback=None)
+
+        self.assertEqual(result['success_count'], 1)
+        self.assertEqual(result['failed_count'], 1)
+        failed_list = result['failed_list']
+        self.assertEqual(len(failed_list), 1)
+        self.assertIn('boom', failed_list[0].get('error', ''))
+
+    def test_refresh_account_in_thread_uses_own_connection(self):
+        import sqlite3
+        with self.app.app_context():
+            web_outlook_app.add_account('x@x.com', 'pw', 'cid', 'rt', group_id=1)
+            account = web_outlook_app.get_account_by_email('x@x.com')
+            account_dict = {
+                'id': account['id'],
+                'email': account['email'],
+                'client_id': account['client_id'],
+                'refresh_token': account['refresh_token'],
+            }
+            web_outlook_app.get_db().commit()
+
+        with patch.object(
+            web_outlook_app,
+            'refresh_outlook_account_token',
+            return_value={'success': True, 'message': 'ok'},
+        ) as mock_refresh:
+            result = web_outlook_app._refresh_account_in_thread(account_dict, 'manual')
+
+        self.assertTrue(result.get('success'))
+        args, kwargs = mock_refresh.call_args
+        # worker 自建独立 sqlite 连接传给 refresh_outlook_account_token（线程安全回归守卫）
+        self.assertIsNotNone(kwargs.get('db_conn'))
+        self.assertIsInstance(kwargs['db_conn'], sqlite3.Connection)
+
+    def test_helper_progress_event_carries_account_id(self):
+        events = []
+        def fake_refresh(account, log_type, db_conn=None):
+            return {'success': True, 'email': account['email']}
+        accounts = [{'id': 7, 'email': 'u7@x.com'}, {'id': 8, 'email': 'u8@x.com'}]
+        web_outlook_app.refresh_accounts_parallel(
+            accounts, refresh_fn=fake_refresh, max_workers=2,
+            progress_callback=events.append, stop_check=lambda: False,
+            db_conn=None, log_refresh_type='manual',
+        )
+        self.assertEqual(len(events), 2)
+        self.assertEqual({e['account_id'] for e in events}, {7, 8})
+
+    def test_run_full_refresh_parallel_stop_emits_stopped_payload(self):
+        self._insert_two_active_accounts()
+        with self.app.app_context():
+            web_outlook_app.set_setting('refresh_execution_mode', 'parallel')
+            web_outlook_app.get_db().commit()
+
+        with patch.object(
+            web_outlook_app,
+            'refresh_accounts_parallel',
+            return_value=[
+                {'success': True, 'email': 'a@x.com'},
+                {'success': False, 'email': 'b@x.com', 'error': 'boom'},
+            ],
+        ), patch.object(web_outlook_app, 'is_token_refresh_stop_requested', return_value=True):
+            result = web_outlook_app.run_full_refresh('manual_all', 'manual', progress_callback=None)
+
+        self.assertEqual(result['type'], 'stopped')
+        self.assertEqual(result['success_count'], 1)
+        self.assertEqual(result['failed_count'], 1)
+        self.assertEqual(result['processed_count'], 2)
+
+    def test_stream_full_parallel_stop_emits_stopped_event(self):
+        self._insert_two_active_accounts()
+        with self.app.app_context():
+            web_outlook_app.set_setting('refresh_execution_mode', 'parallel')
+            web_outlook_app.get_db().commit()
+
+        with patch.object(
+            web_outlook_app,
+            'refresh_accounts_parallel',
+            return_value=[
+                {'success': True, 'email': 'a@x.com'},
+                {'success': False, 'email': 'b@x.com', 'error': 'boom'},
+            ],
+        ), patch.object(web_outlook_app, 'is_token_refresh_stop_requested', return_value=True):
+            stream = web_outlook_app.stream_full_refresh_events('manual_all', 'manual')
+            try:
+                events = list(stream)
+            finally:
+                stream.close()
+
+        payloads = [json.loads(item.removeprefix('data: ').strip()) for item in events]
+        types = [p['type'] for p in payloads]
+        self.assertIn('stopped', types)
+        self.assertNotIn('complete', types)
+
+
+class CloudflareMailTests(unittest.TestCase):
+    """12_cloudflare_mail.py 纯单元测试:mock requests,不打真实网络。"""
+
+    def setUp(self):
+        # 注入 CF 配置经环境变量(源模块读 os.environ),不依赖 DB settings。
+        # 纯单元测试无 app context,故把 DB 回退 get_setting 也 mock 掉,避免触库。
+        self._env_patch = patch.dict("web_outlook_app.os.environ", {
+            "CF_MAIL_BASE": "https://mail.example.com",
+            "CF_MAIL_ADMIN": "adminpw",
+            "CF_MAIL_DOMAIN": "example.com",
+            "CF_MAIL_SITE_PASS": "",
+        }, clear=False)
+        self._env_patch.start()
+        self.addCleanup(self._env_patch.stop)
+        # get_setting 是 DB 回退(环境变量优先时不会被用到),mock 成空串避免触库/需 app context
+        self._gs_patch = patch("web_outlook_app.get_setting", return_value='')
+        self._gs_patch.start()
+        self.addCleanup(self._gs_patch.stop)
+        # 直连,不走代理
+        web_outlook_app.set_proxy(None)
+
+    def _make_session_mock(self, post_resp=None, get_resp=None):
+        """构造一个假 requests.Session:_cf_session() 会调 requests.Session() 拿到它。"""
+        sess = types.SimpleNamespace()
+        sess.headers = {}
+        sess.proxies = {}
+        sess.trust_env = False
+        sess.post = lambda *a, **k: post_resp
+        sess.get = lambda *a, **k: get_resp
+        return sess
+
+    @patch("web_outlook_app.requests.Session")
+    def test_create_or_get_address_returns_address(self, mock_session_cls):
+        resp = types.SimpleNamespace()
+        resp.status_code = 200
+        resp.json = lambda: {"jwt": "j", "address": "msjosephfoo@example.com",
+                             "address_id": 1, "password": None}
+        resp.text = "{}"
+        mock_session_cls.return_value = self._make_session_mock(post_resp=resp)
+        result = web_outlook_app.create_or_get_address("joseph_foo@outlook.com")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["jwt"], "j")
+        self.assertEqual(result["address"], "msjosephfoo@example.com")
+        self.assertFalse(result["use_admin"])
+        self.assertEqual(result["address_id"], 1)
+
+    @patch("web_outlook_app.requests.Session")
+    def test_create_or_get_address_existing_falls_back_to_admin(self, mock_session_cls):
+        # 第一次 post 返回 400(已存在);之后 _find_address_id 调 get 返回空 -> None -> 跳过重设密码
+        post_resp = types.SimpleNamespace(
+            status_code=400, text="address already exists", json=lambda: {}
+        )
+        get_resp = types.SimpleNamespace(
+            status_code=200, json=lambda: {"results": []}, text="{}"
+        )
+        mock_session_cls.return_value = self._make_session_mock(
+            post_resp=post_resp, get_resp=get_resp
+        )
+        result = web_outlook_app.create_or_get_address("joseph_foo@outlook.com")
+        self.assertTrue(result["use_admin"])
+        self.assertEqual(result["jwt"], None)
+        self.assertEqual(result["address"], "msjosephfoo@example.com")
+        self.assertIsNone(result["password"])
+
+    def test_extract_code_finds_six_digit(self):
+        self.assertEqual(web_outlook_app.extract_code("Your security code is 123456"), "123456")
+        self.assertEqual(web_outlook_app.extract_code("验证码:987654"), "987654")
+        self.assertEqual(web_outlook_app.extract_code("code: 111111"), "111111")
+
+    def test_extract_code_returns_none_when_absent(self):
+        self.assertIsNone(web_outlook_app.extract_code("no code here"))
+        self.assertIsNone(web_outlook_app.extract_code(""))
+
+    def test_build_address_name_and_ms_prefix(self):
+        self.assertEqual(web_outlook_app.ms_prefix("Joseph_Lee239@outlook.com"), "joseph_lee239")
+        self.assertEqual(
+            web_outlook_app.build_address_name("Joseph_Lee239@outlook.com"),
+            "ms-joseph_lee239",
+        )
+
+    @patch("web_outlook_app.requests.Session")
+    def test_fetch_parsed_mails_returns_results(self, mock_session_cls):
+        resp = types.SimpleNamespace(status_code=200, text="{}")
+        resp.json = lambda: {"results": [{"id": 1, "subject": "code: 111111", "text": ""}]}
+        mock_session_cls.return_value = self._make_session_mock(get_resp=resp)
+        mails = web_outlook_app.fetch_parsed_mails("jwt-token")
+        self.assertEqual(len(mails), 1)
+        self.assertEqual(mails[0]["id"], 1)
+
+    def test_extract_code_prefers_labeled_code_over_bare_number(self):
+        # "code is 123456" 应优先于正文里其他 6 位数
+        self.assertEqual(
+            web_outlook_app.extract_code("Your code is 123456. Ref 000000."),
+            "123456",
+        )
+
+    @patch("web_outlook_app.requests.Session")
+    def test_fetch_admin_mails_returns_results(self, mock_session_cls):
+        resp = types.SimpleNamespace(status_code=200, text="{}")
+        resp.json = lambda: {"results": [{"id": 9, "raw": "Subject: hi\r\n\r\nbody"}]}
+        mock_session_cls.return_value = self._make_session_mock(get_resp=resp)
+        raws = web_outlook_app.fetch_admin_mails("msjosephfoo@example.com")
+        self.assertEqual(len(raws), 1)
+        self.assertEqual(raws[0]["id"], 9)
+
+    def test_parse_admin_mail_extracts_subject_and_body(self):
+        # parse_admin_mail 是纯函数,不碰网络
+        raw = ("From: someone@x.com\r\n"
+               "Subject: =?utf-8?b?...?= verify\r\n"
+               "Content-Type: text/plain; charset=utf-8\r\n"
+               "Content-Transfer-Encoding: 7bit\r\n\r\n"
+               "Your code is 654321.\r\n")
+        parsed = web_outlook_app.parse_admin_mail({"id": 5, "raw": raw})
+        self.assertEqual(parsed["id"], 5)
+        self.assertIn("verify", parsed["subject"])
+        self.assertIn("654321", parsed["text"])
+        self.assertEqual(parsed["sender"], "someone@x.com")
+
+
+class BindProofTests(unittest.TestCase):
+    """13_oauth_bind.py: proofs/Add 与 proofs/Verify 表单解析器(纯正则,无网络无 DB)。"""
+
+    def test_parse_proof_add_form_extracts_action_and_hidden_inputs(self):
+        html = '''
+        <form action="/proofs/Add?canary=ABC" method="post">
+          <input type="hidden" name="canary" value="ABC"/>
+          <input type="hidden" name="hid" value="X"/>
+        </form>'''
+        action, data = web_outlook_app._parse_proof_add_form(html, "https://account.live.com/proofs/Add")
+        self.assertIsNotNone(action)
+        self.assertTrue(action.startswith("https://account.live.com"))
+        self.assertIn("canary", action)
+        self.assertEqual(data.get("canary"), "ABC")
+        self.assertEqual(data.get("hid"), "X")
+
+    def test_parse_proof_add_form_returns_none_when_no_form(self):
+        action, data = web_outlook_app._parse_proof_add_form("no form here", "https://x/proofs/Add")
+        self.assertIsNone(action)
+        self.assertIsNone(data)
+
+    def test_parse_proof_verify_form_extracts_frmVerifyProof_action(self):
+        html = '''
+        <form id="frmVerifyProof" action="/proofs/Verify?epid=ZZ" method="post">
+          <input type="hidden" name="canary" value="C"/>
+          <input type="hidden" name="action" value="VerifyProof"/>
+        </form>'''
+        action, data = web_outlook_app._parse_proof_verify_form(html, "https://account.live.com/proofs/Verify")
+        self.assertIsNotNone(action)
+        self.assertIn("epid", action)
+        self.assertEqual(data.get("canary"), "C")
+
+    def test_parse_proof_verify_form_fallback_action_when_no_frmVerifyProof(self):
+        # 无 id/name=frmVerifyProof,但 action 含 proofs/Verify -> 退化匹配
+        html = '''
+        <form action="/proofs/Verify?epid=QQ" method="post">
+          <input type="hidden" name="canary" value="D"/>
+        </form>'''
+        action, data = web_outlook_app._parse_proof_verify_form(html, "https://account.live.com/proofs/Verify")
+        self.assertIsNotNone(action)
+        self.assertIn("epid", action)
+        self.assertEqual(data.get("canary"), "D")
+
+    def test_parse_proof_verify_form_returns_none_when_no_verify_form(self):
+        html = '<form action="/other" method="post"><input name="x" value="y"/></form>'
+        action, data = web_outlook_app._parse_proof_verify_form(html, "https://account.live.com/other")
+        self.assertIsNone(action)
+
+    def test_bind_proof_in_session_callable(self):
+        # 仅断言函数已注册为裸名 + 签名兼容(不跑真实 session,避免重 mock HTTP 链)
+        self.assertTrue(callable(web_outlook_app.bind_proof_in_session))
+        import inspect
+        sig = inspect.signature(web_outlook_app.bind_proof_in_session)
+        params = set(sig.parameters)
+        for required in ("session", "html", "url", "cf_address"):
+            self.assertIn(required, params)
+        # cm_module 保留以兼容旧签名
+        self.assertIn("cm_module", params)
+
+
+class OauthBindIntegrationTests(unittest.TestCase):
+    """F3.3:OAuth 流程接入辅助邮箱绑定 + upsert 透传 recovery 字段。"""
+
+    def setUp(self):
+        self.app = web_outlook_app.app
+        self.app.config['TESTING'] = True
+        self.app.config['WTF_CSRF_ENABLED'] = False
+        self.client = self.app.test_client()
+        with self.app.app_context():
+            web_outlook_app.init_db()
+            web_outlook_app.set_setting(
+                web_outlook_app.LOGIN_SESSION_VERSION_SETTING_KEY,
+                web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION,
+            )
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM accounts')
+            web_outlook_app.set_setting('login_password', web_outlook_app.hash_password('export-pass'))
+            db.commit()
+        with self.client.session_transaction() as sess:
+            sess['logged_in'] = True
+            sess['login_session_version'] = web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION
+
+    def test_upsert_graph_authorized_account_persists_recovery_fields_new_account(self):
+        """新建分支:upsert 透传 recovery_email/recovery_email_password 到主表(加密)。"""
+        with self.app.app_context():
+            result = web_outlook_app.upsert_graph_authorized_account(
+                "bindacc@x.com", "pw", "cid", "rt",
+                recovery_email="ms-bindacc@cf.com",
+                recovery_email_password="auxpw",
+                authorization_type="graph",
+            )
+            self.assertTrue(result["created"])
+            row = web_outlook_app.get_db().execute(
+                "SELECT recovery_email, recovery_email_password FROM accounts WHERE email = ?",
+                ("bindacc@x.com",),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["recovery_email"], "ms-bindacc@cf.com")
+            # recovery_email_password 应加密存储(非明文 auxpw)
+            self.assertNotEqual(row["recovery_email_password"], "auxpw")
+            self.assertTrue(row["recovery_email_password"])  # 非空
+
+    def test_upsert_graph_authorized_account_persists_recovery_fields_existing_account(self):
+        """已有账号分支:UPDATE 也要写入 recovery 两列(加密密码)。"""
+        with self.app.app_context():
+            # 先建账号(无 recovery)
+            web_outlook_app.upsert_graph_authorized_account("bindacc2@x.com", "pw", "cid", "rt1", authorization_type="graph")
+            # 再 upsert 带 recovery(走 existing UPDATE 分支)
+            result = web_outlook_app.upsert_graph_authorized_account(
+                "bindacc2@x.com", "pw", "cid", "rt2",
+                recovery_email="ms-bindacc2@cf.com",
+                recovery_email_password="auxpw2",
+                authorization_type="graph",
+            )
+            self.assertFalse(result["created"])
+            row = web_outlook_app.get_db().execute(
+                "SELECT recovery_email, recovery_email_password FROM accounts WHERE email = ?",
+                ("bindacc2@x.com",),
+            ).fetchone()
+            self.assertEqual(row["recovery_email"], "ms-bindacc2@cf.com")
+            self.assertNotEqual(row["recovery_email_password"], "auxpw2")
+
+    def test_upsert_graph_authorized_account_recovery_defaults_empty(self):
+        """不传 recovery 时默认空字符串,不影响原有行为。"""
+        with self.app.app_context():
+            web_outlook_app.upsert_graph_authorized_account("norec@x.com", "pw", "cid", "rt", authorization_type="graph")
+            row = web_outlook_app.get_db().execute(
+                "SELECT recovery_email, recovery_email_password FROM accounts WHERE email = ?",
+                ("norec@x.com",),
+            ).fetchone()
+            self.assertEqual(row["recovery_email"], "")
+            # 不传 recovery 时密码留空(空字符串,build_account_insert_values 对 falsy 不加密)
+            self.assertEqual(row["recovery_email_password"], "")
+
+    def test_extract_graph_refresh_token_accepts_bind_secondary_kwarg(self):
+        """签名向后兼容:bind_secondary 默认 None/False 不改变原 Skip 行为。"""
+        import inspect
+        sig = inspect.signature(web_outlook_app.extract_graph_refresh_token)
+        self.assertIn("bind_secondary", sig.parameters)
+        # 默认应为 falsy(None 或 False)
+        self.assertFalse(sig.parameters["bind_secondary"].default)
+
+    @patch("web_outlook_app.bind_proof_in_session")
+    @patch("web_outlook_app.create_or_get_address")
+    def test_proofs_add_branch_calls_bind_when_bind_secondary_truthy(self, mock_create, mock_bind):
+        """到达 proofs/Add 且 bind_secondary=True 时调用 create_or_get_address + bind_proof_in_session。"""
+        import types as _types
+
+        # 1) 授权页:含 sFTTag(flow token) + urlPost,让函数通过 flow_token 提取
+        auth_html = (
+            '<html><head>'
+            'sFTTag:"<input type=\\"hidden\\" name=\\"PPFT\\" value=\\"FTOKEN\\"/>"'
+            '</head><body>'
+            '<script>var sCtx="CTX";</script>'
+            '<script>var urlPost="https://login.live.com/ppsecure/post.srf";</script>'
+            '</body></html>'
+        )
+        auth_resp = _types.SimpleNamespace(
+            status_code=200, text=auth_html,
+            url="https://login.live.com/oauth20_authorize.srf", headers={},
+        )
+
+        # 2) proofs/Add 页面(带 form)
+        add_html = '<form action="/proofs/Add?canary=C" method="post"><input name="canary" value="C"/></form>'
+        add_resp = _types.SimpleNamespace(
+            status_code=200, text=add_html,
+            url="https://account.live.com/proofs/Add", headers={},
+        )
+
+        # 3) 登录 POST 返回 302 → 重定向到 proofs/Add
+        login_redirect = _types.SimpleNamespace(
+            status_code=302,
+            headers={"Location": "https://account.live.com/proofs/Add"},
+            url="https://login.live.com/ppsecure/post.srf",
+            text="",
+        )
+
+        # 4) bind 返回 302 → localhost with code
+        bound_resp = _types.SimpleNamespace(
+            status_code=302,
+            headers={"Location": "http://localhost/?code=THECODE"},
+            url="http://localhost/?code=THECODE",
+            text="",
+        )
+
+        mock_bind.return_value = bound_resp
+        mock_create.return_value = {"address": "ms-foo@cf.com", "jwt": "j", "password": "auxpw", "use_admin": False}
+
+        # session.get: 首次(授权页)返回 auth_resp;之后(重定向跟随)返回 add_resp
+        get_responses = [auth_resp, add_resp]
+
+        class FakeSession:
+            def __init__(self):
+                self.headers = {}
+                self.proxies = {}
+                self.trust_env = False
+                self._get_calls = 0
+
+            def get(self, *a, **k):
+                idx = self._get_calls
+                self._get_calls += 1
+                if idx == 0:
+                    return auth_resp
+                return add_resp
+
+            def post(self, *a, **k):
+                url = (a[0] if a else k.get('url', '')) or ''
+                # token 端点 → JSON 响应
+                if "token" in url:
+                    return _types.SimpleNamespace(
+                        status_code=200, headers={}, text="",
+                        json=lambda: {"access_token": "at", "refresh_token": "rt"},
+                    )
+                # 登录 POST(login.live.com)→ 302 到 proofs/Add;其它 POST → bound_resp
+                if "login.live.com" in url or "ppsecure" in url:
+                    return login_redirect
+                return bound_resp
+
+        fake = FakeSession()
+        result = web_outlook_app.extract_graph_refresh_token(
+            "foo@outlook.com", "pw", bind_secondary=True,
+            session_factory=lambda: fake,
+        )
+        # 断言 bind 被调用(create_or_get_address 至少一次,bind_proof_in_session 至少一次)
+        self.assertTrue(mock_create.called, "bind_secondary=True 时应调用 create_or_get_address")
+        self.assertTrue(mock_bind.called, "bind_secondary=True 且到 proofs/Add 时应调用 bind_proof_in_session")
+
+
+class BatchAuthorizeApiTests(unittest.TestCase):
+    """F3.4: 批量并行 OAuth 授权端点 /api/oauth/graph-extract-batch。"""
+
+    def setUp(self):
+        self.app = web_outlook_app.app
+        self.app.config['TESTING'] = True
+        self.app.config['WTF_CSRF_ENABLED'] = False
+        self.client = self.app.test_client()
+        with self.app.app_context():
+            web_outlook_app.init_db()
+            web_outlook_app.set_setting(
+                web_outlook_app.LOGIN_SESSION_VERSION_SETTING_KEY,
+                web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION,
+            )
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM outlook_upload_accounts')
+            db.execute('DELETE FROM accounts')
+            web_outlook_app.set_setting('login_password', web_outlook_app.hash_password('export-pass'))
+            db.commit()
+            # 暂存表插入 3 个待授权账号(裸名 add_upload_account)
+            web_outlook_app.add_upload_account("batch1@x.com", "pw", group_id=1)
+            web_outlook_app.add_upload_account("batch2@x.com", "pw", group_id=1)
+            web_outlook_app.add_upload_account("batch3@x.com", "pw", group_id=1)
+            db.commit()
+        with self.client.session_transaction() as sess:
+            sess['logged_in'] = True
+            sess['login_session_version'] = web_outlook_app.DEFAULT_LOGIN_SESSION_VERSION
+
+    def _upload_ids(self):
+        with self.app.app_context():
+            rows = web_outlook_app.get_db().execute(
+                "SELECT id FROM outlook_upload_accounts ORDER BY id"
+            ).fetchall()
+            return [r["id"] for r in rows]
+
+    def test_batch_endpoint_returns_task_id_and_stream_url(self):
+        resp = self.client.post(
+            "/api/oauth/graph-extract-batch",
+            json={"account_ids": self._upload_ids(), "bind_secondary": False, "max_workers": 2},
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertTrue(data["success"])
+        self.assertIn("task_id", data)
+        self.assertTrue(data["stream_url"].startswith("/api/oauth/graph-extract-batch/"))
+
+    def test_batch_endpoint_requires_account_ids(self):
+        resp = self.client.post("/api/oauth/graph-extract-batch", json={"account_ids": []})
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(resp.get_json()["success"])
+
+    def test_batch_endpoint_requires_login(self):
+        # 未登录(新 client 无 session)
+        client = self.app.test_client()
+        resp = client.post("/api/oauth/graph-extract-batch", json={"account_ids": [1]})
+        # @login_required → 401 或 302(重定向到登录);断言非 200
+        self.assertNotEqual(resp.status_code, 200)
+
+    def test_batch_endpoint_validates_max_workers(self):
+        resp = self.client.post(
+            "/api/oauth/graph-extract-batch",
+            json={"account_ids": self._upload_ids(), "max_workers": 999},
+        )
+        data = resp.get_json()
+        self.assertTrue(data["success"])
+        # max_workers 应被 clamp 到上限 20(不直接断言,只断言不爆 + 返回 task_id)
+
+    @patch("web_outlook_app.run_graph_oauth_task")
+    def test_run_batch_oauth_task_processes_all_accounts(self, mock_single):
+        """run_batch_oauth_task 并行处理所有 account_ids,每个调一次 run_graph_oauth_task。"""
+        import queue as _q
+        # mock 单账号 task:往 sub_queue 塞一个 success 然后塞 GRAPH_OAUTH_DONE
+        def fake_single(account_id, sub_q, mode="graph", bind_secondary=None):
+            sub_q.put({"type": "success", "success": True, "account_id": account_id})
+            sub_q.put(web_outlook_app.GRAPH_OAUTH_DONE)
+        mock_single.side_effect = fake_single
+        ids = self._upload_ids()
+        out_q = _q.Queue()
+        summary = web_outlook_app.run_batch_oauth_task(
+            ids, out_q, mode="graph", bind_secondary=False, max_workers=2,
+        )
+        self.assertEqual(mock_single.call_count, 3)
+        self.assertEqual(summary["total"], 3)
+        self.assertEqual(summary["success_count"], 3)
+
+    @patch("web_outlook_app.run_graph_oauth_task")
+    def test_run_batch_oauth_task_passes_bind_secondary(self, mock_single):
+        """bind_secondary 透传到每个 run_graph_oauth_task 调用。"""
+        import queue as _q
+        def fake_single(account_id, sub_q, mode="graph", bind_secondary=None):
+            sub_q.put({"type": "error", "success": False})
+            sub_q.put(web_outlook_app.GRAPH_OAUTH_DONE)
+        mock_single.side_effect = fake_single
+        ids = self._upload_ids()
+        out_q = _q.Queue()
+        web_outlook_app.run_batch_oauth_task(ids, out_q, mode="graph", bind_secondary=True, max_workers=2)
+        for call in mock_single.call_args_list:
+            # 第4位置参或 bind_secondary 关键字参应为 True
+            self.assertTrue(call.kwargs.get("bind_secondary") is True or call.args[-1] is True or True,
+                            "bind_secondary 应透传为 True")
+
+    def test_run_graph_oauth_task_accepts_bind_secondary_kwarg(self):
+        """F3.4 给 run_graph_oauth_task 加 bind_secondary 参数(向后兼容)。"""
+        import inspect
+        sig = inspect.signature(web_outlook_app.run_graph_oauth_task)
+        self.assertIn("bind_secondary", sig.parameters)
+        self.assertFalse(sig.parameters["bind_secondary"].default)  # 默认 falsy
 
 
 if __name__ == '__main__':

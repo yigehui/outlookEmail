@@ -2113,6 +2113,16 @@ def init_db():
 
     cursor.execute('''
         INSERT OR IGNORE INTO settings (key, value)
+        VALUES ('refresh_parallel_workers', '5')
+    ''')
+
+    cursor.execute('''
+        INSERT OR IGNORE INTO settings (key, value)
+        VALUES ('refresh_execution_mode', 'parallel')
+    ''')
+
+    cursor.execute('''
+        INSERT OR IGNORE INTO settings (key, value)
         VALUES ('refresh_cron', '0 2 * * *')
     ''')
 
