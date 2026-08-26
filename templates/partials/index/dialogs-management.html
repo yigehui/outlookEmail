@@ -1369,6 +1369,16 @@
                             <span class="upload-accounts-auth__title">授权日志</span>
                             <span class="upload-accounts-auth__status" id="graphAuthStatus" data-state="idle">空闲</span>
                         </div>
+                        <div class="upload-accounts-auth__options">
+                            <label class="upload-accounts-auth__option" title="未配置 CF 邮箱时将自动跳过绑定，不影响授权">
+                                <input type="checkbox" id="graphAuthBindSecondary" checked>
+                                <span>绑定辅助邮箱并授权</span>
+                            </label>
+                            <div class="upload-accounts-auth__option upload-accounts-auth__option--workers" id="graphAuthWorkersWrap">
+                                <span>并行 worker</span>
+                                <input type="number" class="upload-accounts-auth__workers-input" id="graphAuthMaxWorkers" min="1" max="20" value="5">
+                            </div>
+                        </div>
                         <div class="upload-accounts-auth__mode" role="radiogroup" aria-label="授权模式">
                             <label class="upload-accounts-auth__mode-option">
                                 <input type="radio" name="graphAuthMode" value="imap">
@@ -1563,6 +1573,51 @@
             background: var(--skin-surface, #ffffff);
             color: var(--skin-text, #111827);
             box-shadow: 0 1px 3px rgba(15, 23, 42, 0.12);
+        }
+        .upload-accounts-auth__options {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            padding: 8px;
+            margin-bottom: 8px;
+            border: 1px solid var(--skin-border, #e5e7eb);
+            border-radius: 8px;
+            background: var(--skin-surface-muted, #f8fafc);
+        }
+        .upload-accounts-auth__option {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            color: var(--skin-text, #111827);
+            cursor: pointer;
+            user-select: none;
+        }
+        .upload-accounts-auth__option input[type="checkbox"] {
+            width: 14px;
+            height: 14px;
+            cursor: pointer;
+            accent-color: var(--skin-accent, #2563eb);
+        }
+        .upload-accounts-auth__option--workers {
+            justify-content: flex-start;
+            cursor: default;
+        }
+        .upload-accounts-auth__workers-input {
+            width: 64px;
+            padding: 3px 6px;
+            border: 1px solid var(--skin-border, #e5e7eb);
+            border-radius: 6px;
+            background: var(--skin-surface, #ffffff);
+            color: var(--skin-text, #111827);
+            font-size: 12px;
+            font-family: inherit;
+            text-align: center;
+        }
+        .upload-accounts-auth__workers-input:disabled,
+        .upload-accounts-auth__option input:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
         }
         .upload-accounts-auth__log {
             flex: 1 1 auto;
