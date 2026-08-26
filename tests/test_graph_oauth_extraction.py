@@ -447,6 +447,42 @@ class GraphOauthRouteTests(unittest.TestCase):
         self.assertEqual(extract_mock.call_args.kwargs['scope'], web_outlook_app.GRAPH_EXTRACT_SCOPE)
         self.assertIn('https://outlook.office.com/IMAP.AccessAsUser.All', extract_mock.call_args.kwargs['scope'])
 
+    def _fake_run_graph_oauth_task(self, account_id, sub_q, mode="graph", bind_secondary=None):
+        sub_q.put({"type": "success", "success": True, "account_id": account_id})
+        sub_q.put(web_outlook_app.GRAPH_OAUTH_DONE)
+
+    def test_single_endpoint_defaults_bind_secondary_true(self):
+        """单账号端点不传 bind_secondary 时默认 True 透传给 run_graph_oauth_task。"""
+        account_id = self._add_upload_account(email='bind-default@example.com')
+
+        with patch.object(web_outlook_app, 'run_graph_oauth_task',
+                          side_effect=self._fake_run_graph_oauth_task) as task_mock:
+            stream_url = self._start_graph_task(account_id)
+            _, events = self._consume_stream(stream_url)
+
+        task_mock.assert_called_once()
+        self.assertTrue(task_mock.call_args.kwargs.get('bind_secondary') is True,
+                        '默认 bind_secondary 应为 True')
+        self.assertTrue(events[-1]['success'])
+
+    def test_single_endpoint_respects_bind_secondary_false(self):
+        """单账号端点显式传 bind_secondary=False 时透传 False。"""
+        account_id = self._add_upload_account(email='bind-false@example.com')
+
+        with patch.object(web_outlook_app, 'run_graph_oauth_task',
+                          side_effect=self._fake_run_graph_oauth_task) as task_mock:
+            response = self.client.post('/api/oauth/graph-extract-token', json={
+                'account_id': account_id,
+                'bind_secondary': False,
+            })
+            self.assertEqual(response.status_code, 200)
+            _, events = self._consume_stream(response.get_json()['stream_url'])
+
+        task_mock.assert_called_once()
+        self.assertTrue(task_mock.call_args.kwargs.get('bind_secondary') is False,
+                        'bind_secondary=False 应原样透传')
+        self.assertTrue(events[-1]['success'])
+
     def test_stream_validation_failure_does_not_write_or_mark_authorized(self):
         account_id = self._add_upload_account(email='invalid-token@example.com')
 
@@ -826,6 +862,33 @@ class GraphOauthFrontendContractTests(unittest.TestCase):
         self.assertIn('/outlook-auto-auth', js)
         # The request body does not include a password field
         self.assertNotIn('password:', js.split('queueAccountForOutlookAutoAuth')[1].split('window.queueAccountForOutlookAutoAuth')[0])
+
+    def test_graph_auth_panel_exposes_bind_secondary_and_workers_controls(self):
+        """授权侧栏暴露「绑定辅助邮箱」复选框 + 并行 worker 数控件，JS 读取并透传。"""
+        root = os.path.dirname(os.path.dirname(__file__))
+        with open(
+            os.path.join(root, 'templates/partials/index/dialogs-management.html'),
+            encoding='utf-8',
+        ) as handle:
+            html = handle.read()
+        with open(
+            os.path.join(root, 'static/js/index/12-outlook-upload-accounts.js'),
+            encoding='utf-8',
+        ) as handle:
+            js = handle.read()
+
+        # HTML：复选框默认勾选 + worker 数输入框
+        self.assertIn('id="graphAuthBindSecondary" checked', html)
+        self.assertIn('id="graphAuthMaxWorkers"', html)
+        self.assertIn('min="1" max="20"', html)
+        self.assertIn('value="5"', html)
+        # JS：读取函数 + 透传到单账号端点与 batch 端点
+        self.assertIn('function getGraphAuthBindSecondary', js)
+        self.assertIn('function getGraphAuthMaxWorkers', js)
+        # 单账号与 batch 两个 POST body 均带 bind_secondary；batch 另带 max_workers
+        self.assertIn('bind_secondary: bindSecondary', js)
+        self.assertIn('/api/oauth/graph-extract-batch', js)
+        self.assertIn('max_workers: maxWorkers', js)
 
 
 if __name__ == '__main__':

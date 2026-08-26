@@ -801,8 +801,9 @@ def api_graph_extract_token():
         return jsonify({'success': False, 'error': '邮箱或密码为空'}), 400
 
     mode = normalize_graph_oauth_mode(data.get('mode'))
+    bind_secondary = bool(data.get('bind_secondary', True))
     task_id = uuid.uuid4().hex
-    GRAPH_OAUTH_TASKS[task_id] = {'account_id': account_id, 'mode': mode}
+    GRAPH_OAUTH_TASKS[task_id] = {'account_id': account_id, 'mode': mode, 'bind_secondary': bind_secondary}
     return jsonify({
         'success': True,
         'task_id': task_id,
@@ -827,6 +828,7 @@ def api_graph_extract_token_stream(task_id: str):
         worker = threading.Thread(
             target=run_graph_oauth_task,
             args=(int(task['account_id']), output_queue, normalize_graph_oauth_mode(task.get('mode'))),
+            kwargs={'bind_secondary': task.get('bind_secondary')},
             name=f"graph-oauth-{task_id[:8]}",
             daemon=True,
         )

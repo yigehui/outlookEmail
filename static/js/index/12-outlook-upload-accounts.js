@@ -19,8 +19,6 @@
             editingRowId: null,
             currentData: [],
             selectedIds: new Set(),
-            batchAuthQueue: [],
-            batchAuthRunning: false,
         };
 
         let graphAuthState = {
@@ -29,6 +27,12 @@
             secretLength: 0,
             eventSource: null,
             running: false,
+            // 批量并行授权（接 /api/oauth/graph-extract-batch）
+            batchRunning: false,
+            batchTotal: 0,
+            batchDone: 0,
+            batchSuccessCount: 0,
+            batchFailed: [],
         };
 
         function normalizeUploadAccountsPageSize(value) {
@@ -114,13 +118,13 @@
                 selectAll.indeterminate = visibleSelectedCount > 0 && visibleSelectedCount < visibleIds.length;
             }
             if (authorizeBtn && authorizeBtn.dataset.loading !== 'true') {
-                authorizeBtn.disabled = selectedIds.length === 0 || graphAuthState.running || uploadAccountsState.batchAuthRunning;
+                authorizeBtn.disabled = selectedIds.length === 0 || graphAuthState.running || graphAuthState.batchRunning;
                 authorizeBtn.textContent = selectedIds.length > 1
                     ? `批量授权 (${selectedIds.length})`
                     : '批量授权';
             }
             if (deleteBtn && deleteBtn.dataset.loading !== 'true') {
-                deleteBtn.disabled = selectedIds.length === 0 || graphAuthState.running || uploadAccountsState.batchAuthRunning;
+                deleteBtn.disabled = selectedIds.length === 0 || graphAuthState.running || graphAuthState.batchRunning;
                 deleteBtn.textContent = selectedIds.length > 1
                     ? `批量删除 (${selectedIds.length})`
                     : '批量删除';
@@ -131,7 +135,7 @@
                 cb.checked = id ? uploadAccountsState.selectedIds.has(id) : false;
                 cb.disabled = uploadAccountsState.editingRowId !== null
                     || graphAuthState.running
-                    || uploadAccountsState.batchAuthRunning;
+                    || graphAuthState.batchRunning;
             });
         }
 
@@ -357,7 +361,7 @@
                 const isEditing = uploadAccountsState.editingRowId === itemId;
                 const selectDisabled = uploadAccountsState.editingRowId !== null
                     || graphAuthState.running
-                    || uploadAccountsState.batchAuthRunning;
+                    || graphAuthState.batchRunning;
                 const checkboxCell = `
                     <td>
                         <input type="checkbox"
@@ -406,7 +410,7 @@
                     const authBtnLabel = item.is_authorized ? '重新授权' : '授权';
                     const editDisabled = uploadAccountsState.editingRowId !== null
                         || graphAuthState.running
-                        || uploadAccountsState.batchAuthRunning;
+                        || graphAuthState.batchRunning;
                     const authBtn = `<button class="btn btn-sm btn-primary" type="button" style="width: 80px;" ${editDisabled ? 'disabled' : ''} data-graph-auth-account-id="${escapeHtml(String(itemId))}" data-graph-auth-email="${escapeHtml(itemEmail)}" data-graph-auth-password-length="${escapeHtml(String(item.password_length || 0))}">${authBtnLabel}</button>`;
                     const editBtn = `<button class="btn btn-sm btn-secondary" type="button" ${editDisabled ? 'disabled' : ''} onclick="enterRowEditMode(${escapeHtml(String(itemId))}, '${escapeHtml(itemEmail)}', '${escapeHtml(itemRemark)}')">修改</button>`;
                     const deleteBtn = `<button class="btn btn-sm btn-danger" type="button" ${editDisabled ? 'disabled' : ''} data-delete-account-id="${escapeHtml(String(itemId))}" data-delete-account-email="${escapeHtml(itemEmail)}">删除</button>`;
@@ -584,8 +588,11 @@
             uploadAccountsState.keyword = '';
             uploadAccountsState.authStatus = 'all';
             uploadAccountsState.selectedIds.clear();
-            uploadAccountsState.batchAuthQueue = [];
-            uploadAccountsState.batchAuthRunning = false;
+            graphAuthState.batchRunning = false;
+            graphAuthState.batchTotal = 0;
+            graphAuthState.batchDone = 0;
+            graphAuthState.batchSuccessCount = 0;
+            graphAuthState.batchFailed = [];
             const input = document.getElementById('uploadAccountsSearch');
             if (input) input.value = '';
             initializeUploadAccountsPageSize();
@@ -605,8 +612,7 @@
                 graphAuthState.eventSource = null;
             }
             graphAuthState.running = false;
-            uploadAccountsState.batchAuthQueue = [];
-            uploadAccountsState.batchAuthRunning = false;
+            graphAuthState.batchRunning = false;
             hideModal('outlookUploadAccountsModal');
         }
 
@@ -807,30 +813,6 @@
             syncUploadAccountSelectionUi();
         }
 
-        function continueBatchAuthQueue() {
-            if (!uploadAccountsState.batchAuthRunning) {
-                return;
-            }
-            const next = uploadAccountsState.batchAuthQueue.shift();
-            if (!next) {
-                uploadAccountsState.batchAuthRunning = false;
-                appendGraphAuthLog('');
-                appendGraphAuthLog('批量授权队列已完成');
-                setGraphAuthStatus('success', '批量完成');
-                const authorizeBtn = document.getElementById('batchAuthorizeUploadAccountsBtn');
-                if (authorizeBtn) {
-                    authorizeBtn.dataset.loading = 'false';
-                }
-                setUploadAuthButtonsDisabled(false);
-                loadUploadAccounts();
-                return;
-            }
-            const remaining = uploadAccountsState.batchAuthQueue.length;
-            appendGraphAuthLog('');
-            appendGraphAuthLog(`批量授权：开始处理 ${next.email || next.accountId}（剩余 ${remaining}）`);
-            startGraphAuthForAccount(next.accountId, next.email, next.passwordLength, { fromBatch: true });
-        }
-
         function appendGraphAuthLog(message) {
             const logEl = document.getElementById('graphAuthLog');
             if (!logEl) return;
@@ -850,9 +832,27 @@
             return GRAPH_AUTH_MODE_LABELS[mode] || GRAPH_AUTH_MODE_LABELS.graph;
         }
 
-        async function startGraphAuthForAccount(accountId, email, passwordLength, options = {}) {
-            const fromBatch = !!options.fromBatch;
-            if (graphAuthState.running) {
+        function getGraphAuthBindSecondary() {
+            const el = document.getElementById('graphAuthBindSecondary');
+            // 默认勾选绑定辅助邮箱；未配置 CF 邮箱时后端静默回退，不影响授权
+            return el ? el.checked : true;
+        }
+
+        function getGraphAuthMaxWorkers() {
+            const el = document.getElementById('graphAuthMaxWorkers');
+            if (!el) return 5;
+            const parsed = parseInt(el.value, 10);
+            if (!Number.isFinite(parsed)) return 5;
+            return Math.min(20, Math.max(1, parsed));
+        }
+
+        function setGraphAuthWorkersDisabled(disabled) {
+            const input = document.getElementById('graphAuthMaxWorkers');
+            if (input) input.disabled = disabled;
+        }
+
+        async function startGraphAuthForAccount(accountId, email, passwordLength) {
+            if (graphAuthState.running || graphAuthState.batchRunning) {
                 showToast('正在授权中，请等待当前任务完成', 'warning');
                 return;
             }
@@ -872,27 +872,22 @@
             graphAuthState.running = true;
             const authMode = getGraphAuthMode();
             const authModeLabel = getGraphAuthModeLabel(authMode);
+            const bindSecondary = getGraphAuthBindSecondary();
 
             setUploadAuthButtonsDisabled(true);
-            setGraphAuthStatus('running', fromBatch ? '批量授权中' : '授权中');
+            setGraphAuthWorkersDisabled(true);
+            setGraphAuthStatus('running', '授权中');
 
             const logEl = document.getElementById('graphAuthLog');
-            if (logEl && !fromBatch) {
+            if (logEl) {
                 logEl.textContent = `开始 ${authModeLabel} OAuth 授权流程...`;
-            } else if (logEl && fromBatch && !String(logEl.textContent || '').includes('批量授权')) {
-                logEl.textContent = `开始批量 ${authModeLabel} OAuth 授权...`;
             }
             const startTime = Date.now();
 
             const finishAuth = (state, statusText) => {
                 graphAuthState.running = false;
-                if (fromBatch || uploadAccountsState.batchAuthRunning) {
-                    setGraphAuthStatus(state, statusText);
-                    // 批量队列继续；按钮状态由队列结束时统一恢复
-                    continueBatchAuthQueue();
-                    return;
-                }
                 setUploadAuthButtonsDisabled(false);
+                setGraphAuthWorkersDisabled(false);
                 setGraphAuthStatus(state, statusText);
             };
 
@@ -900,6 +895,7 @@
                 appendGraphAuthLog('邮箱: ' + email);
                 appendGraphAuthLog('密码: ' + '*'.repeat(Math.max(6, graphAuthState.secretLength)));
                 appendGraphAuthLog('授权模式: ' + authModeLabel);
+                appendGraphAuthLog('绑定辅助邮箱: ' + (bindSecondary ? '是' : '否'));
                 appendGraphAuthLog('');
                 appendGraphAuthLog('正在创建授权任务...');
                 appendGraphAuthLog('');
@@ -911,7 +907,8 @@
                     },
                     body: JSON.stringify({
                         account_id: accountId,
-                        mode: authMode
+                        mode: authMode,
+                        bind_secondary: bindSecondary
                     })
                 });
 
@@ -960,7 +957,7 @@
                             graphAuthState.eventSource = null;
                         }
                         finishAuth(payload.success ? 'success' : 'error', payload.success ? '成功' : '失败');
-                        if (payload.success && !fromBatch && !uploadAccountsState.batchAuthRunning) {
+                        if (payload.success) {
                             setTimeout(() => {
                                 loadUploadAccounts();
                             }, 1000);
@@ -987,7 +984,7 @@
         document.addEventListener('click', (event) => {
             const button = event.target.closest('[data-graph-auth-account-id]');
             if (!button) return;
-            if (uploadAccountsState.batchAuthRunning) {
+            if (graphAuthState.batchRunning) {
                 showToast('批量授权进行中，请等待完成', 'warning');
                 return;
             }
@@ -999,7 +996,7 @@
         });
 
         async function authorizeSelectedUploadAccounts() {
-            if (graphAuthState.running || uploadAccountsState.batchAuthRunning) {
+            if (graphAuthState.running || graphAuthState.batchRunning) {
                 showToast('正在授权中，请等待当前任务完成', 'warning');
                 return;
             }
@@ -1009,36 +1006,164 @@
                 return;
             }
 
-            const queue = selectedIds.map(accountId => {
-                const item = (uploadAccountsState.currentData || []).find(row => Number(row.id) === accountId) || {};
-                return {
-                    accountId,
-                    email: item.email || '',
-                    passwordLength: item.password_length || 0,
-                };
-            });
+            const authMode = getGraphAuthMode();
+            const authModeLabel = getGraphAuthModeLabel(authMode);
+            const bindSecondary = getGraphAuthBindSecondary();
+            const maxWorkers = getGraphAuthMaxWorkers();
+            const total = selectedIds.length;
+            const effectiveWorkers = Math.min(maxWorkers, total);
+
+            const workerHint = total < maxWorkers
+                ? `（设定 ${maxWorkers}，按账号数调整为 ${effectiveWorkers}）`
+                : `（${effectiveWorkers}）`;
 
             if (!(await showConfirmModal(
-                `确定按当前授权模式串行授权所选 ${queue.length} 个账号吗？`,
+                `确定按当前授权模式并行授权所选 ${total} 个账号吗？\nworker：${effectiveWorkers}${total < maxWorkers ? `（设定 ${maxWorkers}，按账号数调整）` : ''}\n绑定辅助邮箱：${bindSecondary ? '是' : '否'}`,
                 { title: '批量授权', confirmText: '开始授权', danger: false }
             ))) {
                 return;
             }
 
-            uploadAccountsState.batchAuthQueue = queue;
-            uploadAccountsState.batchAuthRunning = true;
+            graphAuthState.batchRunning = true;
+            graphAuthState.batchTotal = total;
+            graphAuthState.batchDone = 0;
+            graphAuthState.batchSuccessCount = 0;
+            graphAuthState.batchFailed = [];
+
             const authorizeBtn = document.getElementById('batchAuthorizeUploadAccountsBtn');
             if (authorizeBtn) {
                 authorizeBtn.dataset.loading = 'true';
                 authorizeBtn.disabled = true;
                 authorizeBtn.textContent = '批量授权中...';
             }
+            setUploadAuthButtonsDisabled(true);
+            setGraphAuthWorkersDisabled(true);
             syncUploadAccountSelectionUi();
+            setGraphAuthStatus('running', `批量 0/${total}`);
+
             const logEl = document.getElementById('graphAuthLog');
             if (logEl) {
-                logEl.textContent = `开始批量授权，共 ${queue.length} 个账号（串行）`;
+                logEl.textContent = `开始并行 ${authModeLabel} 授权，共 ${total} 个，worker=${effectiveWorkers}，绑定辅助邮箱=${bindSecondary ? '是' : '否'}${total < maxWorkers ? `（设定 ${maxWorkers}，按账号数调整）` : ''}`;
             }
-            continueBatchAuthQueue();
+
+            try {
+                const response = await fetch('/api/oauth/graph-extract-batch', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        account_ids: selectedIds,
+                        mode: authMode,
+                        bind_secondary: bindSecondary,
+                        max_workers: maxWorkers
+                    })
+                });
+
+                const data = await response.json();
+                if (!response.ok || !data.success || !data.stream_url) {
+                    appendGraphAuthLog('创建批量授权任务失败: ' + (data.error || '未知错误'));
+                    showToast('批量授权失败: ' + (data.error || '未知错误'), 'error');
+                    finishBatchAuth('error', '失败');
+                    return;
+                }
+
+                appendGraphAuthLog('批量授权任务已创建，等待后端进度...');
+                graphAuthState.eventSource = new EventSource(data.stream_url);
+                graphAuthState.eventSource.onmessage = (event) => handleBatchAuthSseEvent(event, authMode);
+                graphAuthState.eventSource.onerror = () => {
+                    appendGraphAuthLog('批量授权日志连接中断');
+                    finishBatchAuth('error', '连接中断');
+                };
+            } catch (error) {
+                appendGraphAuthLog('');
+                appendGraphAuthLog('批量授权请求失败: ' + error.message);
+                showToast('批量授权请求失败: ' + error.message, 'error');
+                finishBatchAuth('error', '失败');
+            }
+        }
+
+        function handleBatchAuthSseEvent(event, authMode) {
+            let payload;
+            try {
+                payload = JSON.parse(event.data);
+            } catch (parseError) {
+                appendGraphAuthLog(event.data);
+                return;
+            }
+
+            if (payload.type === 'ping') {
+                return;
+            }
+
+            if (payload.type === 'start') {
+                const total = payload.total || graphAuthState.batchTotal || 0;
+                graphAuthState.batchTotal = total;
+                const bindLabel = payload.bind_secondary === false ? '否' : '是';
+                appendGraphAuthLog(`后端已启动：共 ${total} 个，模式 ${getGraphAuthModeLabel(payload.mode || authMode)}，绑定辅助邮箱=${bindLabel}`);
+                return;
+            }
+
+            if (payload.type === 'progress') {
+                const index = payload.index || 0;
+                const total = payload.total || graphAuthState.batchTotal || 0;
+                graphAuthState.batchDone = index;
+                const accountId = payload.account_id;
+                if (payload.success) {
+                    graphAuthState.batchSuccessCount++;
+                    appendGraphAuthLog(`[${index}/${total}] 账号 ${accountId} 成功`);
+                } else {
+                    graphAuthState.batchFailed.push({ account_id: accountId, error: payload.error || '未知错误' });
+                    appendGraphAuthLog(`[${index}/${total}] 账号 ${accountId} 失败：${payload.error || '未知错误'}`);
+                }
+                setGraphAuthStatus('running', `批量 ${index}/${total}`);
+                return;
+            }
+
+            if (payload.type === 'complete') {
+                const total = payload.total || graphAuthState.batchTotal || 0;
+                const successCount = payload.success_count != null ? payload.success_count : graphAuthState.batchSuccessCount;
+                // 用后端汇总的 failed 覆盖前端累计（后端为权威）
+                const failed = Array.isArray(payload.failed) ? payload.failed : graphAuthState.batchFailed;
+                graphAuthState.batchFailed = failed;
+                const failedCount = total - successCount;
+
+                appendGraphAuthLog('');
+                appendGraphAuthLog(`完成：成功 ${successCount}/${total}，失败 ${failedCount}`);
+                if (failed.length) {
+                    appendGraphAuthLog('失败明细：');
+                    failed.forEach(f => {
+                        appendGraphAuthLog(`  - 账号 ${f.account_id}：${f.error || '未知错误'}`);
+                    });
+                }
+                showToast(`批量授权完成：成功 ${successCount}/${total}`, failedCount ? 'warning' : 'success');
+                if (graphAuthState.eventSource) {
+                    graphAuthState.eventSource.close();
+                    graphAuthState.eventSource = null;
+                }
+                finishBatchAuth(failedCount ? 'error' : 'success', failedCount ? `完成（失败 ${failedCount}）` : '批量完成');
+                setTimeout(() => {
+                    loadUploadAccounts();
+                }, 1000);
+            }
+        }
+
+        function finishBatchAuth(state, statusText) {
+            graphAuthState.batchRunning = false;
+            graphAuthState.running = false;
+            if (graphAuthState.eventSource) {
+                graphAuthState.eventSource.close();
+                graphAuthState.eventSource = null;
+            }
+            const authorizeBtn = document.getElementById('batchAuthorizeUploadAccountsBtn');
+            if (authorizeBtn) {
+                authorizeBtn.dataset.loading = 'false';
+                authorizeBtn.disabled = false;
+                authorizeBtn.textContent = '批量授权';
+            }
+            setUploadAuthButtonsDisabled(false);
+            setGraphAuthWorkersDisabled(false);
+            setGraphAuthStatus(state, statusText);
         }
 
         async function deleteUploadAccount(accountId, email) {
@@ -1064,7 +1189,7 @@
         }
 
         async function deleteSelectedUploadAccounts() {
-            if (graphAuthState.running || uploadAccountsState.batchAuthRunning) {
+            if (graphAuthState.running || graphAuthState.batchRunning) {
                 showToast('授权进行中，请稍后再删除', 'warning');
                 return;
             }
