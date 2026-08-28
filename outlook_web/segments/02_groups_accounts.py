@@ -1620,10 +1620,13 @@ def resolve_upload_group_id(group_id: Any = None) -> int:
 
 def add_upload_account(email: str, password: str, remark: str = '',
                        group_id: Any = None, proxy_url: str = '',
-                       tag_ids: Any = None) -> Dict[str, Any]:
+                       tag_ids: Any = None,
+                       recovery_email: str = '',
+                       recovery_password: str = '') -> Dict[str, Any]:
     """插入一条外部上传的 Outlook 账号到 outlook_upload_accounts。
 
-    密码加密存储。不在本函数内 commit，由调用方统一提交。
+    密码/recovery_password 加密存储。不在本函数内 commit，由调用方统一提交。
+    recovery_email/recovery_password 可空（导入时不带辅助邮箱的旧格式）。
     返回 {'email', 'status': 'added'|'duplicate'|'invalid', 'id'?}
     """
     normalized_email = normalize_upload_email(email)
@@ -1634,13 +1637,16 @@ def add_upload_account(email: str, password: str, remark: str = '',
     resolved_group_id = resolve_upload_group_id(group_id)
     encoded_tag_ids = encode_upload_tag_ids(tag_ids)
     normalized_proxy = str(proxy_url or '').strip()
+    normalized_recovery = str(recovery_email or '').strip()
+    raw_recovery_pw = recovery_password if recovery_password is not None else ''
 
     db = get_db()
     cursor = db.execute(
         '''
         INSERT OR IGNORE INTO outlook_upload_accounts
-            (email, password, remark, source, group_id, proxy_url, tag_ids)
-        VALUES (?, ?, ?, 'external_api', ?, ?, ?)
+            (email, password, remark, source, group_id, proxy_url, tag_ids,
+             recovery_email, recovery_email_password)
+        VALUES (?, ?, ?, 'external_api', ?, ?, ?, ?, ?)
         ''',
         (
             normalized_email,
@@ -1649,6 +1655,8 @@ def add_upload_account(email: str, password: str, remark: str = '',
             resolved_group_id,
             normalized_proxy,
             encoded_tag_ids,
+            normalized_recovery,
+            encrypt_data(raw_recovery_pw) if raw_recovery_pw else '',
         ),
     )
     if cursor.rowcount == 1:
@@ -1659,6 +1667,7 @@ def add_upload_account(email: str, password: str, remark: str = '',
             'group_id': resolved_group_id,
             'proxy_url': normalized_proxy,
             'tag_ids': decode_upload_tag_ids(encoded_tag_ids),
+            'recovery_email': normalized_recovery,
         }
     return {'email': normalized_email, 'status': 'duplicate'}
 
@@ -2008,6 +2017,8 @@ def add_upload_accounts_bulk(items: List[Dict[str, Any]]) -> Dict[str, Any]:
             group_id=item.get('group_id'),
             proxy_url=item.get('proxy_url', ''),
             tag_ids=item.get('tag_ids'),
+            recovery_email=item.get('recovery_email', ''),
+            recovery_password=item.get('recovery_password', ''),
         )
         if outcome['status'] == 'added':
             added += 1

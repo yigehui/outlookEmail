@@ -1265,6 +1265,62 @@ class OutlookUploadImportRouteTests(unittest.TestCase):
         )
         self.assertNotEqual(response.status_code, 200)
 
+    def test_four_segments_persists_recovery_email_and_encrypted_password(self):
+        # 四段格式：邮箱----密码----辅助邮箱----辅助邮箱密码
+        response = self.client.post(
+            '/api/outlook-upload-accounts/import',
+            json={'account_string': 'a@outlook.com----p1----rec@x.com----recpw'},
+        )
+        payload = response.get_json()
+        self.assertEqual(payload['added'], 1)
+        self.assertEqual(payload['invalid'], 0)
+        with self.app.app_context():
+            row = web_outlook_app.get_db().execute(
+                'SELECT recovery_email, recovery_email_password FROM outlook_upload_accounts WHERE email = ?',
+                ('a@outlook.com',),
+            ).fetchone()
+        self.assertEqual(row['recovery_email'], 'rec@x.com')
+        # recovery_email_password 必须加密存储（不等于明文 recpw）
+        self.assertNotEqual(row['recovery_email_password'], 'recpw')
+        self.assertTrue(row['recovery_email_password'])
+        # 且能解密回明文
+        self.assertEqual(web_outlook_app.decrypt_data(row['recovery_email_password']), 'recpw')
+
+    def test_two_segments_keeps_recovery_empty(self):
+        # 老两段格式：后两段缺省为空，recovery 列留空
+        response = self.client.post(
+            '/api/outlook-upload-accounts/import',
+            json={'account_string': 'b@outlook.com----p2'},
+        )
+        payload = response.get_json()
+        self.assertEqual(payload['added'], 1)
+        with self.app.app_context():
+            row = web_outlook_app.get_db().execute(
+                'SELECT recovery_email, recovery_email_password FROM outlook_upload_accounts WHERE email = ?',
+                ('b@outlook.com',),
+            ).fetchone()
+        self.assertEqual(row['recovery_email'], '')
+        # 两段格式 recovery_email_password 存空串（非 NULL）
+        self.assertEqual(row['recovery_email_password'], '')
+
+    def test_three_segments_recovery_without_password(self):
+        # 三段格式：邮箱----密码----辅助邮箱（无辅助邮箱密码）
+        response = self.client.post(
+            '/api/outlook-upload-accounts/import',
+            json={'account_string': 'c@outlook.com----p3----rec3@x.com'},
+        )
+        payload = response.get_json()
+        self.assertEqual(payload['added'], 1)
+        self.assertEqual(payload['invalid'], 0)
+        with self.app.app_context():
+            row = web_outlook_app.get_db().execute(
+                'SELECT recovery_email, recovery_email_password FROM outlook_upload_accounts WHERE email = ?',
+                ('c@outlook.com',),
+            ).fetchone()
+        self.assertEqual(row['recovery_email'], 'rec3@x.com')
+        # 未带密码 → recovery_email_password 留空（NULL 或空）
+        self.assertFalse(row['recovery_email_password'] or '')
+
 
 if __name__ == '__main__':
     unittest.main()
