@@ -710,6 +710,48 @@
             }
         }
 
+        async function submitAddUploadAccountBatch() {
+            const batchInput = document.getElementById('addUploadAccountBatchInput');
+            const accountString = batchInput ? batchInput.value.trim() : '';
+            const groupId = parseInt(document.getElementById('addUploadAccountGroupSelect')?.value || '0', 10) || 1;
+            const proxyUrl = document.getElementById('addUploadAccountProxyUrl')?.value.trim() || '';
+            const tagIds = getAddUploadAccountSelectedTagIds();
+
+            if (!accountString) {
+                showToast('请输入账号信息', 'error');
+                return;
+            }
+
+            const btn = document.getElementById('submitAddUploadAccountBatchBtn');
+            if (btn) btn.disabled = true;
+
+            try {
+                const response = await fetch('/api/outlook-upload-accounts/import', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        account_string: accountString,
+                        group_id: groupId,
+                        proxy_url: proxyUrl,
+                        tag_ids: tagIds,
+                    })
+                });
+                const data = await response.json();
+                if (data.success) {
+                    showToast(data.message || '导入完成', 'success');
+                    if (batchInput) batchInput.value = '';
+                    clearAddAccountForm();
+                    reloadUploadAccounts();
+                } else {
+                    handleApiError(data, '导入失败');
+                }
+            } catch (error) {
+                showToast('导入失败: ' + error.message, 'error');
+            } finally {
+                if (btn) btn.disabled = false;
+            }
+        }
+
         // ==================== 修改上传账号 ====================
 
         function enterRowEditMode(accountId, email, remark) {

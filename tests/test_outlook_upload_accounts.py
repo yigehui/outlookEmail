@@ -891,7 +891,12 @@ class OutlookUploadFrontendStructureTests(unittest.TestCase):
         self.assertIn("authorizeSelectedUploadAccounts", js)
         self.assertIn("deleteSelectedUploadAccounts", js)
         self.assertIn('/api/outlook-upload-accounts/batch-delete', js)
-        self.assertIn('batchAuthQueue', js)
+        # 批量授权已改为接并行 batch 端点（graphAuthState.batchRunning + SSE），不再用串行队列
+        self.assertIn('batchRunning', js)
+        self.assertIn('/api/oauth/graph-extract-batch', js)
+        self.assertIn('handleBatchAuthSseEvent', js)
+        self.assertNotIn('batchAuthQueue', js)
+        self.assertNotIn('continueBatchAuthQueue', js)
 
         self.assertIn('id="batchOutlookAutoAuthBtn"', layout)
         self.assertIn('queueSelectedAccountsForOutlookAutoAuth()', layout)
@@ -1134,6 +1139,131 @@ class OutlookUploadUpdateRouteTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 404)
         self.assertFalse(response.get_json()['success'])
+
+
+class OutlookUploadImportRouteTests(unittest.TestCase):
+    """POST /api/outlook-upload-accounts/import 批量导入邮箱密码测试。"""
+
+    def setUp(self):
+        self.app = web_outlook_app.app
+        self.app.config['TESTING'] = True
+        self.app.config['WTF_CSRF_ENABLED'] = False
+        self.client = self.app.test_client()
+        with self.app.app_context():
+            web_outlook_app.init_db()
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM outlook_upload_accounts')
+            clear_upload_management_fixtures(db)
+            db.commit()
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+
+    def test_empty_body_returns_400(self):
+        response = self.client.post('/api/outlook-upload-accounts/import', json={})
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(response.get_json()['success'])
+
+    def test_import_two_accounts_added(self):
+        response = self.client.post(
+            '/api/outlook-upload-accounts/import',
+            json={'account_string': 'a@outlook.com----p1\nb@outlook.com----p2'},
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['added'], 2)
+        self.assertEqual(payload['duplicate'], 0)
+        self.assertEqual(payload['invalid'], 0)
+        self.assertEqual(payload['total'], 2)
+        self.assertIn('已添加 2', payload['message'])
+        with self.app.app_context():
+            rows = web_outlook_app.get_db().execute(
+                'SELECT email FROM outlook_upload_accounts ORDER BY email'
+            ).fetchall()
+        self.assertEqual([r['email'] for r in rows], ['a@outlook.com', 'b@outlook.com'])
+
+    def test_duplicate_email_counts_duplicate(self):
+        with self.app.app_context():
+            web_outlook_app.add_upload_account('dup@outlook.com', 'old')
+            web_outlook_app.get_db().commit()
+        response = self.client.post(
+            '/api/outlook-upload-accounts/import',
+            json={'account_string': 'dup@outlook.com----new\nnew@outlook.com----p2'},
+        )
+        payload = response.get_json()
+        self.assertEqual(payload['added'], 1)
+        self.assertEqual(payload['duplicate'], 1)
+        self.assertEqual(payload['invalid'], 0)
+        self.assertEqual(payload['total'], 2)
+
+    def test_insufficient_segments_counted_as_invalid(self):
+        # 无 ---- → 解析层 invalid
+        response = self.client.post(
+            '/api/outlook-upload-accounts/import',
+            json={'account_string': 'bad-no-separator\nok@outlook.com----p1'},
+        )
+        payload = response.get_json()
+        self.assertEqual(payload['added'], 1)
+        self.assertEqual(payload['invalid'], 1)
+        self.assertEqual(payload['total'], 2)
+
+    def test_invalid_email_no_at_counted_as_invalid(self):
+        # 有 ---- 但邮箱缺 @ → bulk 层 invalid
+        response = self.client.post(
+            '/api/outlook-upload-accounts/import',
+            json={'account_string': 'bad----p1\nok@outlook.com----p2'},
+        )
+        payload = response.get_json()
+        self.assertEqual(payload['added'], 1)
+        self.assertEqual(payload['invalid'], 1)
+        self.assertEqual(payload['total'], 2)
+
+    def test_group_id_falls_back_to_default_when_omitted(self):
+        response = self.client.post(
+            '/api/outlook-upload-accounts/import',
+            json={'account_string': 'g@outlook.com----p1'},
+        )
+        self.assertEqual(response.status_code, 200)
+        with self.app.app_context():
+            row = web_outlook_app.get_db().execute(
+                'SELECT group_id FROM outlook_upload_accounts WHERE email = ?',
+                ('g@outlook.com',),
+            ).fetchone()
+        self.assertEqual(row['group_id'], web_outlook_app.DEFAULT_GROUP_ID)
+
+    def test_tag_ids_and_proxy_transmitted(self):
+        with self.app.app_context():
+            group_id = web_outlook_app.add_group('上传目标分组')
+            tag_id = web_outlook_app.add_tag('上传标签A', '#111')
+            self.assertIsNotNone(group_id)
+            self.assertIsNotNone(tag_id)
+        response = self.client.post(
+            '/api/outlook-upload-accounts/import',
+            json={
+                'account_string': 't@outlook.com----p1',
+                'group_id': group_id,
+                'proxy_url': 'socks5://user:pass@host:1080',
+                'tag_ids': [tag_id],
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        with self.app.app_context():
+            row = web_outlook_app.get_db().execute(
+                'SELECT group_id, proxy_url, tag_ids FROM outlook_upload_accounts WHERE email = ?',
+                ('t@outlook.com',),
+            ).fetchone()
+        self.assertEqual(row['group_id'], group_id)
+        self.assertEqual(row['proxy_url'], 'socks5://user:pass@host:1080')
+        self.assertEqual(row['tag_ids'], str(tag_id))
+
+    def test_requires_login(self):
+        with self.client.session_transaction() as session:
+            session['logged_in'] = False
+        response = self.client.post(
+            '/api/outlook-upload-accounts/import',
+            json={'account_string': 'x@outlook.com----p1'},
+        )
+        self.assertNotEqual(response.status_code, 200)
 
 
 if __name__ == '__main__':
