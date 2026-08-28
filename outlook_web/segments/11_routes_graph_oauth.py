@@ -133,12 +133,16 @@ def extract_graph_refresh_token(
     session_factory: Optional[Callable[[], Any]] = None,
     proxy_url: str = None,
     bind_secondary: Any = None,
+    recovery_email: str = '',
+    recovery_password: str = '',
 ) -> Dict[str, Any]:
     """使用纯 HTTP OAuth2 授权码流程提取 Outlook refresh_token。
 
-    bind_secondary 真值时,流程到达 proofs/Add 会尝试绑定 CF 辅助邮箱
-    (create_or_get_address + bind_proof_in_session),成功后 recovery_email/
-    recovery_email_password 随成功 dict 返回,由调用方透传给 upsert。
+    bind_secondary 真值时,流程到达 proofs/Add 会尝试绑定辅助邮箱：
+    - recovery_email 非空（导入带了辅助邮箱）：直接用该地址绑定,跳过 CF 建邮箱,
+      收码走 CF admin API（需 CF 渠道）；recovery_password 作为辅助邮箱密码回传。
+    - 否则：create_or_get_address 建 CF 临时邮箱绑定。
+    成功后 recovery_email/recovery_email_password 随成功 dict 返回,由调用方透传给 upsert。
     """
     _pending_recovery_email = ""
     _pending_recovery_password = ""
@@ -327,15 +331,28 @@ def extract_graph_refresh_token(
 
             if "proofs/Add" in current_url or "proofs/add" in current_url:
                 if bind_secondary:
-                    try:
-                        cf_info = create_or_get_address(email)
-                        cf_address = cf_info.get("address")
-                        cf_jwt = cf_info.get("jwt")
-                        cf_pw = cf_info.get("password") or ""
-                        use_admin = cf_info.get("use_admin", False)
-                    except Exception as exc:
-                        graph_oauth_log(log, f"CF 辅助邮箱分配失败，回退 Skip: {exc}")
-                        cf_address = None
+                    cf_address = None
+                    cf_jwt = None
+                    cf_pw = ""
+                    use_admin = False
+                    # 优先：导入时带了辅助邮箱，直接用它绑定，跳过 CF 建邮箱。
+                    # 收码仍走 CF admin API（需 CF 渠道配置）。
+                    if recovery_email:
+                        cf_address = recovery_email
+                        cf_jwt = None
+                        cf_pw = recovery_password
+                        use_admin = True
+                        graph_oauth_log(log, f"使用导入的辅助邮箱绑定: {recovery_email}")
+                    else:
+                        try:
+                            cf_info = create_or_get_address(email)
+                            cf_address = cf_info.get("address")
+                            cf_jwt = cf_info.get("jwt")
+                            cf_pw = cf_info.get("password") or ""
+                            use_admin = cf_info.get("use_admin", False)
+                        except Exception as exc:
+                            graph_oauth_log(log, f"CF 辅助邮箱分配失败，回退 Skip: {exc}")
+                            cf_address = None
                     if cf_address:
                         bound_resp = bind_proof_in_session(
                             session, text, current_url,
@@ -437,7 +454,8 @@ def get_upload_account_for_graph_auth(account_id: int):
     db = get_db()
     return db.execute(
         '''
-        SELECT id, email, password, is_authorized, remark, group_id, proxy_url, tag_ids
+        SELECT id, email, password, is_authorized, remark, group_id, proxy_url, tag_ids,
+               recovery_email, recovery_email_password
         FROM outlook_upload_accounts
         WHERE id = ?
         ''',
@@ -599,6 +617,16 @@ def run_graph_oauth_task(account_id: int, output_queue: "queue.Queue[Dict[str, A
                 emit({"type": "complete", "success": False})
                 return
 
+            # 导入时若带了辅助邮箱，授权到 proofs/Add 直接用它绑定，跳过 CF 建邮箱。
+            recovery_email = str(upload_row['recovery_email'] or '').strip()
+            recovery_password = ''
+            recovery_password_enc = str(upload_row['recovery_email_password'] or '')
+            if recovery_email and recovery_password_enc:
+                try:
+                    recovery_password = decrypt_data(recovery_password_enc) or ''
+                except Exception:
+                    recovery_password = ''
+
             mode_label = graph_oauth_mode_label(mode)
             scope = GRAPH_EXTRACT_SCOPE_BY_MODE[mode]
             proxy_config = get_upload_account_resolved_proxy_config(upload_row)
@@ -621,6 +649,8 @@ def run_graph_oauth_task(account_id: int, output_queue: "queue.Queue[Dict[str, A
                 log=log,
                 proxy_url=auth_proxy_url,
                 bind_secondary=bind_secondary,
+                recovery_email=recovery_email,
+                recovery_password=recovery_password,
             )
             if not result.get("success"):
                 emit({

@@ -596,6 +596,8 @@ def api_get_settings():
     settings['cloudflare_worker_domain'] = get_cloudflare_worker_domain()
     settings['cloudflare_email_domains'] = ', '.join(get_cloudflare_email_domains())
     settings['cloudflare_admin_password'] = get_cloudflare_admin_password()
+    # 绑定辅助邮箱复用的 CF 渠道（名称，空=用默认渠道）
+    settings['bind_cf_channel'] = get_setting('bind_cf_channel', '')
     settings.pop('cloudflare_ai_username_api_key', None)
     cloudflare_ai_api_key = get_setting_decrypted('cloudflare_ai_username_api_key', '')
     settings['cloudflare_ai_username_enabled'] = get_setting('cloudflare_ai_username_enabled', 'false')
@@ -932,6 +934,13 @@ def api_update_settings():
             updated.append('Cloudflare 管理密码')
         else:
             errors.append('更新 Cloudflare 管理密码失败')
+
+    if 'bind_cf_channel' in data:
+        new_channel = str(data['bind_cf_channel'] or '').strip()
+        if set_setting('bind_cf_channel', new_channel):
+            updated.append('绑定辅助邮箱 CF 渠道')
+        else:
+            errors.append('保存绑定辅助邮箱 CF 渠道失败')
 
     if 'cloudflare_ai_username_enabled' in data:
         enabled = normalize_bool_setting_value(data['cloudflare_ai_username_enabled'])
@@ -1561,8 +1570,12 @@ def api_add_outlook_upload_account():
 @app.route('/api/outlook-upload-accounts/import', methods=['POST'])
 @login_required
 def api_import_outlook_upload_accounts():
-    """批量导入外部上传的 Outlook 账号（邮箱+密码，每行一条，---- 分隔）。
+    """批量导入外部上传的 Outlook 账号（每行一条，---- 分隔）。
 
+    行格式（后两段可空，兼容老两段格式）：
+      邮箱----密码
+      邮箱----密码----辅助邮箱
+      邮箱----密码----辅助邮箱----辅助邮箱密码
     请求体：{account_string, group_id?, proxy_url?, tag_ids?, remark?}
     返回：{success, added, duplicate, invalid, total, message}
     """
@@ -1588,12 +1601,15 @@ def api_import_outlook_upload_accounts():
             continue
         email = parts[0].strip()
         password = parts[1].strip()
+        recovery_email = parts[2].strip() if len(parts) >= 3 else ''
+        recovery_password = parts[3].strip() if len(parts) >= 4 else ''
         if not email or not password:
             parse_invalid += 1
             continue
         items.append({
             'email': email, 'password': password, 'remark': remark,
             'group_id': group_id, 'proxy_url': proxy_url, 'tag_ids': tag_ids,
+            'recovery_email': recovery_email, 'recovery_password': recovery_password,
         })
 
     if not items:

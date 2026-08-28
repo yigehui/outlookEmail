@@ -691,6 +691,15 @@
                     </div>
                     <div class="settings-panel settings-panel-grid">
                         <div class="form-group settings-form-span-full">
+                            <label class="form-label">绑定辅助邮箱用 CF 渠道</label>
+                            <select class="form-select" id="settingsBindCfChannel">
+                                <option value="">使用默认渠道</option>
+                            </select>
+                            <div class="form-hint">授权时自动绑定辅助邮箱，复用上方 Cloudflare 渠道配置；留空则用默认渠道。仅对「未带辅助邮箱」的导入账号生效。</div>
+                        </div>
+                    </div>
+                    <div class="settings-panel settings-panel-grid">
+                        <div class="form-group settings-form-span-full">
                             <label class="checkbox-label">
                                 <input type="checkbox" id="settingsCloudflareAiEnabled">
                                 <span>启用 AI 生成用户名</span>
@@ -1295,10 +1304,10 @@
                                 <div class="upload-accounts-add-batch" style="margin-top: 14px; border-top: 1px dashed var(--skin-border, #e0e0e0); padding-top: 14px; width: 100%; box-sizing: border-box;">
                                     <div style="margin-bottom: 6px;">
                                         <label class="add-form-label" style="font-weight: 600; display: block; margin-bottom: 4px;">批量导入</label>
-                                        <span style="font-size: 12px; color: var(--skin-text-muted, #888); display: block;">每行一条，格式：邮箱----密码（四个减号）；分组 / 标签 / 代理共用上方单条表单设置</span>
+                                        <span style="font-size: 12px; color: var(--skin-text-muted, #888); display: block;">每行一条，格式：邮箱----密码----辅助邮箱----辅助邮箱密码（四个减号分隔，后两段可空）；分组 / 标签 / 代理共用上方单条表单设置</span>
                                     </div>
                                     <textarea id="addUploadAccountBatchInput" class="form-textarea"
-                                        rows="6" placeholder="user1@outlook.com----password1&#10;user2@outlook.com----password2"
+                                        rows="6" placeholder="user@outlook.com----pass----recovery@x.com----recoverpass&#10;user2@outlook.com----pass2（不带辅助邮箱）"
                                         style="width: 100%; min-height: 120px; resize: vertical; font-family: ui-monospace, monospace; box-sizing: border-box;"></textarea>
                                     <div style="margin-top: 10px; display: flex; gap: 10px; align-items: center;">
                                         <button class="btn btn-primary" type="button" id="submitAddUploadAccountBatchBtn" onclick="submitAddUploadAccountBatch()" style="white-space: nowrap;">批量导入</button>

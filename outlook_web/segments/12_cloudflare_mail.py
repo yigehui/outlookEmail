@@ -78,9 +78,41 @@ def _cf_session():
     return s
 
 
+def _resolve_bind_channel():
+    """优先用设置页指定的 CF 渠道（bind_cf_channel 渠道名），否则默认渠道，都没有返回 None。
+    include_secret=True 才返回解密后的 admin_password。需在 app context 内调用。"""
+    try:
+        name = (get_setting('bind_cf_channel', '') or '').strip()
+        if name:
+            ch = get_cloudflare_channel_by_name(name, include_secret=True)
+            if ch:
+                return ch
+        ch = get_default_cloudflare_channel(include_secret=True)
+        if ch:
+            return ch
+    except Exception:
+        return None
+    return None
+
+
 def _cfg():
-    # 环境变量优先 > DB settings(get_setting) > 默认空。
-    # F3.6 之后可在设置页配置 cf_mail_* 而无需环境变量。
+    # 渠道优先：设置页 bind_cf_channel 指定渠道 > 默认渠道；都没有才回退环境变量/DB cf_mail_*。
+    # 渠道表无 site_pass/proxy 字段，这两项仍只走环境变量（可选）。
+    # F3.6 之后可在设置页选 CF 渠道而无需环境变量。
+    channel = _resolve_bind_channel()
+    if channel:
+        worker = (channel.get('worker_domain', '') or '').strip().rstrip('/')
+        base = f"https://{worker}" if worker else ''
+        admin = channel.get('admin_password', '') or ''
+        domains = channel.get('email_domains')
+        if isinstance(domains, list):
+            domain = domains[0].strip() if domains else ''
+        else:
+            parts = str(domains or '').split(',')
+            domain = parts[0].strip() if parts else ''
+        site_pass = os.environ.get("CF_MAIL_SITE_PASS") or get_setting('cf_mail_site_pass', '')
+        return base, admin, domain, site_pass
+    # 回退：环境变量优先 > DB settings(get_setting) > 默认空。
     base = (os.environ.get("CF_MAIL_BASE") or get_setting('cf_mail_base', '') or "").strip().rstrip("/")
     admin = os.environ.get("CF_MAIL_ADMIN") or get_setting('cf_mail_admin', '')
     domain = (os.environ.get("CF_MAIL_DOMAIN") or get_setting('cf_mail_domain', '') or "").strip()

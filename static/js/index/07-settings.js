@@ -1782,6 +1782,28 @@
             }
         }
 
+        async function populateBindCfChannelSelect(selectedName) {
+            const select = document.getElementById('settingsBindCfChannel');
+            if (!select) return;
+            const keep = selectedName || '';
+            try {
+                const resp = await fetch('/api/cloudflare/channels');
+                const data = await resp.json();
+                const channels = (data && data.success && Array.isArray(data.channels)) ? data.channels : [];
+                // 保留「使用默认渠道」空选项
+                select.innerHTML = '<option value="">使用默认渠道</option>' +
+                    channels.map(ch => `<option value="${escapeHtml(ch.name || '')}">${escapeHtml(ch.name || `#${ch.id}`)}${ch.is_default ? '（默认）' : ''}${!ch.enabled ? '（已停用）' : ''}</option>`).join('');
+                if (keep && Array.from(select.options).some(o => o.value === keep)) {
+                    select.value = keep;
+                } else {
+                    select.value = '';
+                }
+            } catch (e) {
+                select.innerHTML = '<option value="">使用默认渠道</option>';
+                select.value = '';
+            }
+        }
+
         async function loadSettings() {
             ensureForwardingSettingsUI();
             try {
@@ -1796,6 +1818,7 @@
                     document.getElementById('settingsExternalApiKey').value = data.settings.external_api_key || '';
                     document.getElementById('settingsDuckmailBaseUrl').value = data.settings.duckmail_base_url || '';
                     document.getElementById('settingsDuckmailApiKey').value = data.settings.duckmail_api_key || '';
+                    populateBindCfChannelSelect(data.settings.bind_cf_channel || '');
                     document.getElementById('settingsCloudflareAiEnabled').checked = String(data.settings.cloudflare_ai_username_enabled) === 'true';
                     document.getElementById('settingsCloudflareAiApiUrl').value = data.settings.cloudflare_ai_username_api_url || '';
                     document.getElementById('settingsCloudflareAiModel').value = data.settings.cloudflare_ai_username_model || '';
@@ -1911,6 +1934,7 @@
             settings.cloudflare_ai_username_api_url = document.getElementById('settingsCloudflareAiApiUrl')?.value.trim() || '';
             settings.cloudflare_ai_username_model = document.getElementById('settingsCloudflareAiModel')?.value.trim() || '';
             settings.cloudflare_ai_username_prompt = document.getElementById('settingsCloudflareAiPrompt')?.value.trim() || '';
+            settings.bind_cf_channel = document.getElementById('settingsBindCfChannel')?.value || '';
             const cloudflareAiApiKey = document.getElementById('settingsCloudflareAiApiKey')?.value.trim() || '';
             if (cloudflareAiApiKey) {
                 settings.cloudflare_ai_username_api_key = cloudflareAiApiKey;
