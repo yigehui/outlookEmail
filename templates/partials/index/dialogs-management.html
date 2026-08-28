@@ -1292,6 +1292,18 @@
                                         <button class="btn btn-primary add-form-submit" type="button" id="submitAddUploadAccountBtn" onclick="submitAddUploadAccount()">立即添加</button>
                                     </div>
                                 </div>
+                                <div class="upload-accounts-add-batch" style="margin-top: 14px; border-top: 1px dashed var(--skin-border, #e0e0e0); padding-top: 14px; width: 100%; box-sizing: border-box;">
+                                    <div style="margin-bottom: 6px;">
+                                        <label class="add-form-label" style="font-weight: 600; display: block; margin-bottom: 4px;">批量导入</label>
+                                        <span style="font-size: 12px; color: var(--skin-text-muted, #888); display: block;">每行一条，格式：邮箱----密码（四个减号）；分组 / 标签 / 代理共用上方单条表单设置</span>
+                                    </div>
+                                    <textarea id="addUploadAccountBatchInput" class="form-textarea"
+                                        rows="6" placeholder="user1@outlook.com----password1&#10;user2@outlook.com----password2"
+                                        style="width: 100%; min-height: 120px; resize: vertical; font-family: ui-monospace, monospace; box-sizing: border-box;"></textarea>
+                                    <div style="margin-top: 10px; display: flex; gap: 10px; align-items: center;">
+                                        <button class="btn btn-primary" type="button" id="submitAddUploadAccountBatchBtn" onclick="submitAddUploadAccountBatch()" style="white-space: nowrap;">批量导入</button>
+                                    </div>
+                                </div>
                                 <div class="form-hint" style="margin-top: 8px;">
                                     分组 / 标签 / 账号代理会在<strong>首次授权成功并新建正式账号</strong>时写入；若正式账号已存在则仅更新授权信息，保留原分组/标签/代理。账号代理支持 <code>{mail}</code> 占位符，自动授权时也会按该邮箱展开并走代理。建议优先使用 <code>socks5h://</code>：IMAP 令牌请求仅支持 HTTPS CONNECT / SOCKS5 代理，普通 HTTP 代理不可用。
                                 </div>

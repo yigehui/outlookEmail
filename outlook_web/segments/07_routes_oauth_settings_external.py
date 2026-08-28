@@ -1558,6 +1558,66 @@ def api_add_outlook_upload_account():
         return jsonify({'success': False, 'error': '邮箱格式无效'}), 400
 
 
+@app.route('/api/outlook-upload-accounts/import', methods=['POST'])
+@login_required
+def api_import_outlook_upload_accounts():
+    """批量导入外部上传的 Outlook 账号（邮箱+密码，每行一条，---- 分隔）。
+
+    请求体：{account_string, group_id?, proxy_url?, tag_ids?, remark?}
+    返回：{success, added, duplicate, invalid, total, message}
+    """
+    data = request.get_json(silent=True) or {}
+    account_str = data.get('account_string', '')
+    if not account_str or not account_str.strip():
+        return jsonify({'success': False, 'error': '请输入账号信息'}), 400
+
+    group_id = data.get('group_id')
+    proxy_url = str(data.get('proxy_url', '') or '').strip()
+    tag_ids = data.get('tag_ids')
+    remark = str(data.get('remark', '') or '').strip()  # 可选，整体应用到所有行；默认留空
+
+    parse_invalid = 0
+    items = []
+    for line in account_str.strip().split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split('----')
+        if len(parts) < 2:
+            parse_invalid += 1
+            continue
+        email = parts[0].strip()
+        password = parts[1].strip()
+        if not email or not password:
+            parse_invalid += 1
+            continue
+        items.append({
+            'email': email, 'password': password, 'remark': remark,
+            'group_id': group_id, 'proxy_url': proxy_url, 'tag_ids': tag_ids,
+        })
+
+    if not items:
+        return jsonify({
+            'success': True, 'added': 0, 'duplicate': 0,
+            'invalid': parse_invalid, 'total': parse_invalid,
+            'message': f'解析失败 {parse_invalid} 行，无有效账号',
+        })
+
+    result = add_upload_accounts_bulk(items)
+    added = result.get('added', 0)
+    duplicate = result.get('duplicate', 0)
+    bulk_invalid = result.get('invalid', 0)
+    # 分层 invalid：解析层（段数不足/空段）+ bulk 层（add_upload_account 校验失败，如缺 @）
+    invalid = parse_invalid + bulk_invalid
+    total = result.get('total', len(items)) + parse_invalid
+
+    return jsonify({
+        'success': True, 'added': added, 'duplicate': duplicate,
+        'invalid': invalid, 'total': total,
+        'message': f'已添加 {added}，重复 {duplicate}，无效 {invalid} 行',
+    })
+
+
 @app.route('/api/outlook-upload-accounts/<int:account_id>', methods=['PUT'])
 @login_required
 def api_update_outlook_upload_account(account_id):
