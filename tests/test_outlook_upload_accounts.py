@@ -1322,5 +1322,64 @@ class OutlookUploadImportRouteTests(unittest.TestCase):
         self.assertFalse(row['recovery_email_password'] or '')
 
 
+class SaveGraphAuthorizationResultRecoveryTests(unittest.TestCase):
+    """save_graph_authorization_result：授权转正式表时 recovery 的回退逻辑。
+    场景：导入带了辅助邮箱，但账号已在别处绑过，授权没进 proofs/Add，
+    流程不返回 recovery → 应回退用 upload_row 里导入的 recovery，不丢。"""
+
+    def setUp(self):
+        self.app = web_outlook_app.app
+        self.app.config['TESTING'] = True
+        with self.app.app_context():
+            web_outlook_app.init_db()
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM outlook_upload_accounts')
+            db.execute('DELETE FROM accounts WHERE email LIKE ?', ('recover-fallback-%',))
+            db.commit()
+
+    def _add_upload_with_recovery(self):
+        with self.app.app_context():
+            web_outlook_app.add_upload_account(
+                'recover-fallback@outlook.com', 'pw',
+                recovery_email='rec@x.com', recovery_password='recpw',
+            )
+            web_outlook_app.get_db().commit()
+            return web_outlook_app.get_db().execute(
+                'SELECT * FROM outlook_upload_accounts WHERE email = ?',
+                ('recover-fallback@outlook.com',),
+            ).fetchone()
+
+    def test_no_flow_recovery_falls_back_to_uploaded_recovery(self):
+        # 流程没返回 recovery（没进 proofs/Add）→ 用 upload_row 导入的 recovery
+        upload_row = self._add_upload_with_recovery()
+        with self.app.app_context():
+            web_outlook_app.save_graph_authorization_result(
+                upload_row, 'cid', 'rt', authorization_type='graph',
+                recovery_email='', recovery_email_password='',
+            )
+            row = web_outlook_app.get_db().execute(
+                'SELECT recovery_email, recovery_email_password FROM accounts WHERE email = ?',
+                ('recover-fallback@outlook.com',),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row['recovery_email'], 'rec@x.com')
+        self.assertEqual(web_outlook_app.decrypt_data(row['recovery_email_password']), 'recpw')
+
+    def test_flow_recovery_takes_priority_over_uploaded(self):
+        # 流程返回了 recovery（走绑定页建的 CF 邮箱）→ 用流程的，不用 upload_row 的
+        upload_row = self._add_upload_with_recovery()
+        with self.app.app_context():
+            web_outlook_app.save_graph_authorization_result(
+                upload_row, 'cid', 'rt', authorization_type='graph',
+                recovery_email='cf-built@x.com', recovery_email_password='cfpw',
+            )
+            row = web_outlook_app.get_db().execute(
+                'SELECT recovery_email, recovery_email_password FROM accounts WHERE email = ?',
+                ('recover-fallback@outlook.com',),
+            ).fetchone()
+        self.assertEqual(row['recovery_email'], 'cf-built@x.com')
+        self.assertEqual(web_outlook_app.decrypt_data(row['recovery_email_password']), 'cfpw')
+
+
 if __name__ == '__main__':
     unittest.main()

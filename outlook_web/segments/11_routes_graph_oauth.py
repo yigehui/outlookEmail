@@ -575,6 +575,18 @@ def save_graph_authorization_result(upload_row: Any, client_id: str,
     email = str(upload_row['email'] or '').strip()
     password = get_upload_account_plain_password(upload_row)
     row_data = dict(upload_row) if hasattr(upload_row, 'keys') else {}
+    # recovery 优先用流程返回值（走绑定页时=实际绑上去的邮箱，如建的 CF 邮箱）；
+    # 流程没返回（没进 proofs/Add，如账号已绑过）则回退到导入时入库的 recovery，
+    # 保证导入带的辅助邮箱不会在转正式表时丢失。
+    final_recovery_email = (recovery_email or '').strip() or str(row_data.get('recovery_email') or '').strip()
+    final_recovery_password = recovery_email_password
+    if not final_recovery_password:
+        enc_pw = str(row_data.get('recovery_email_password') or '')
+        if enc_pw:
+            try:
+                final_recovery_password = decrypt_data(enc_pw) or ''
+            except Exception:
+                final_recovery_password = ''
     save_result = upsert_graph_authorized_account(
         email,
         password,
@@ -585,8 +597,8 @@ def save_graph_authorization_result(upload_row: Any, client_id: str,
         tag_ids=decode_upload_tag_ids(row_data.get('tag_ids')),
         remark=str(row_data.get('remark') or ''),
         authorization_type=authorization_type,
-        recovery_email=recovery_email,
-        recovery_email_password=recovery_email_password,
+        recovery_email=final_recovery_email,
+        recovery_email_password=final_recovery_password,
     )
     mark_upload_account_authorized(int(upload_row['id']))
     get_db().commit()
