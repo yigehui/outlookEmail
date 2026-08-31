@@ -103,7 +103,13 @@ def _cfg():
     if channel:
         worker = (channel.get('worker_domain', '') or '').strip().rstrip('/')
         base = f"https://{worker}" if worker else ''
-        admin = channel.get('admin_password', '') or ''
+        # 渠道表 admin_password 是加密存储的（format_cloudflare_channel(include_secret=True)
+        # 只回传密文，不负责解密），必须先 decrypt_data 再放进 x-admin-auth，否则 401。
+        admin_enc = channel.get('admin_password', '') or ''
+        try:
+            admin = decrypt_data(admin_enc).strip() if admin_enc else ''
+        except Exception:
+            admin = ''
         domains = channel.get('email_domains')
         if isinstance(domains, list):
             domain = domains[0].strip() if domains else ''
