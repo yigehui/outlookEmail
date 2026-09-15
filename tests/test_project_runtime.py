@@ -2,6 +2,7 @@ import importlib
 import io
 import os
 import pathlib
+import re
 import sys
 import tempfile
 import types
@@ -4182,6 +4183,526 @@ class OauthBindIntegrationTests(unittest.TestCase):
         # 断言 bind 被调用(create_or_get_address 至少一次,bind_proof_in_session 至少一次)
         self.assertTrue(mock_create.called, "bind_secondary=True 时应调用 create_or_get_address")
         self.assertTrue(mock_bind.called, "bind_secondary=True 且到 proofs/Add 时应调用 bind_proof_in_session")
+
+
+class InterruptPageAuthTests(unittest.TestCase):
+    """2026-09 新中断页纯协议处理:credentialaction 绑定 / passkey skip / App-Confirm。
+
+    用 FakeSession 录制回放:session.get 忽略 status/Location,url 视为已跟随重定向后的值;
+    因此 URL 类落点用返回对象的 url 触发,页面类落点用 text 触发。
+    """
+
+    def _auth_html(self):
+        return (
+            '<html><head>'
+            'sFTTag:"<input type=\\"hidden\\" name=\\"PPFT\\" value=\\"FTOKEN\\"/>"'
+            '</head><body>'
+            '<script>var sCtx="CTX";</script>'
+            '<script>var urlPost="https://login.live.com/ppsecure/post.srf";</script>'
+            '</body></html>'
+        )
+
+    def _auth_resp(self):
+        return types.SimpleNamespace(
+            status_code=200, text=self._auth_html(),
+            url="https://login.live.com/oauth20_authorize.srf", headers={},
+        )
+
+    def _token_resp(self):
+        return types.SimpleNamespace(
+            status_code=200, headers={}, text="",
+            json=lambda: {"access_token": "at", "refresh_token": "rt"},
+        )
+
+    def _make_fake_session(self, hop_responses, login_response):
+        """hop_responses: 登录后主循环按顺序消费的响应(最后一个应带 localhost?code)。"""
+        outer = self
+
+        class FakeSession:
+            def __init__(self):
+                self.headers = {}
+                self.proxies = {}
+                self.trust_env = False
+                self._get_index = 0
+                self._hop_index = 0
+                self.get_calls = []
+                self.post_calls = []
+
+            def get(self, url, **kwargs):
+                self.get_calls.append((url, kwargs))
+                # 第一次 get 是授权页;之后主循环重定向跟随消费 hop_responses
+                if self._get_index == 0:
+                    self._get_index += 1
+                    return outer._auth_resp()
+                self._get_index += 1
+                if self._hop_index < len(hop_responses):
+                    resp = hop_responses[self._hop_index]
+                    self._hop_index += 1
+                    return resp
+                # 兜底:一直返回最后一个(localhost code)
+                return hop_responses[-1]
+
+            def post(self, url, data=None, **kwargs):
+                self.post_calls.append((url, data or {}, kwargs, kwargs.get('json')))
+                if "token" in url:
+                    return outer._token_resp()
+                if "login.live.com" in url or "ppsecure" in url:
+                    return login_response
+                raise AssertionError(f"unexpected POST {url}")
+
+        return FakeSession()
+
+    @patch("web_outlook_app._fetch_latest_code_fallback", return_value=None)
+    @patch("web_outlook_app.wait_for_code", return_value="123456")
+    @patch("web_outlook_app.fetch_admin_mails", return_value=[{"id": 7}])
+    @patch("web_outlook_app.create_or_get_address")
+    def test_credentialaction_binds_secondary_and_continues(
+            self, mock_create, _mock_mails, _mock_wait, _mock_fallback):
+        """落 interrupt/credentialaction:POST email + activate 成功 → 重新 authorize 拿 code。"""
+        mock_create.return_value = {
+            "address": "ms-foo@cf.com", "jwt": "jwt", "password": "auxpw", "use_admin": False,
+        }
+        interrupt_url = "https://account.live.com/interrupt/credentialaction?ctx=x"
+        server_data = (
+            'ServerData = {"apiCanary":"CANARY1",'
+            '"acmaInitialResponse":{"continuationToken":"CONT-TOKEN"}};'
+        )
+        interrupt_resp = types.SimpleNamespace(
+            status_code=200,
+            text=f'<html><input name="uaid" value="UAID-1"/><script>{server_data}</script></html>',
+            url=interrupt_url, headers={},
+        )
+        email_api_resp = types.SimpleNamespace(
+            status_code=200, text="", headers={},
+            json=lambda: {"state": "verify", "apiCanary": "CANARY2"},
+        )
+        activate_resp = types.SimpleNamespace(status_code=200, text="", headers={})
+        # 绑定后 POST authorize 落到 Consent 的 DoSubmit 跳板页(hidden 是 HTML 转义的)
+        consent_bouncer = types.SimpleNamespace(
+            status_code=200, headers={},
+            url="https://account.live.com/Consent/Update?id=293577",
+            text=('<html><body onload="DoSubmit();"><script>function DoSubmit(){}'
+                  'var fmHF=1;</script>'
+                  '<form action="https://account.live.com/Consent/Update?x=1">'
+                  '<input name="scenarios" value="[{&quot;a&quot;:&amp;b}]"/></form></body></html>'),
+        )
+        localhost_resp = types.SimpleNamespace(
+            status_code=200, text="", url="http://localhost/?code=THECODE", headers={},
+        )
+        login_response = types.SimpleNamespace(
+            status_code=302, headers={"Location": interrupt_url},
+            url="https://login.live.com/ppsecure/post.srf", text="",
+        )
+
+        session = self._make_fake_session([interrupt_resp, consent_bouncer, localhost_resp], login_response)
+        original_post = session.post
+
+        def routed_post(url, data=None, **kwargs):
+            if url.endswith("/auth/methods/email"):
+                session.post_calls.append((url, data or {}, kwargs, kwargs.get('json')))
+                return email_api_resp
+            if url.endswith("/auth/methods/email/activate"):
+                session.post_calls.append((url, data or {}, kwargs, kwargs.get('json')))
+                return activate_resp
+            if "Consent/Update" in str(url):
+                session.post_calls.append((url, data or {}, kwargs, kwargs.get('json')))
+                return localhost_resp
+            return original_post(url, data=data, **kwargs)
+
+        session.post = routed_post
+
+        result = web_outlook_app.extract_graph_refresh_token(
+            "foo@outlook.com", "pw", bind_secondary=True, session_factory=lambda: session,
+        )
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["refresh_token"], "rt")
+        # 真的走了中断页绑定 API
+        email_posts = [c for c in session.post_calls if str(c[0]).endswith("/auth/methods/email")]
+        activate_posts = [c for c in session.post_calls if str(c[0]).endswith("/activate")]
+        self.assertEqual(len(email_posts), 1)
+        self.assertEqual(len(activate_posts), 1)
+        self.assertEqual(email_posts[0][3]["email"], "ms-foo@cf.com")
+        self.assertEqual(email_posts[0][3]["continuationToken"], "CONT-TOKEN")
+        self.assertEqual(activate_posts[0][3]["otp"], "123456")
+        # 绑定成功后重新 GET authorize(不能用 POST:不带 body 会被 AAD 拒 AADSTS900144)
+        self.assertTrue(
+            any("oauth2/v2.0/authorize" in str(c[0]) for c in session.get_calls[1:]),
+            session.get_calls,
+        )
+        # Consent 跳板页的 hidden 已反转义后提交
+        consent_posts = [c for c in session.post_calls if "Consent/Update" in str(c[0])]
+        self.assertEqual(len(consent_posts), 1)
+        self.assertEqual(consent_posts[0][1].get("scenarios"), '[{"a":&b}]')
+        # recovery 回传落主表用
+        self.assertEqual(result["recovery_email"], "ms-foo@cf.com")
+        self.assertEqual(result["recovery_email_password"], "auxpw")
+
+    @patch("web_outlook_app.create_or_get_address")
+    def test_credentialaction_without_bind_flag_fails_with_actionable_error(self, mock_create):
+        """bind_secondary=False 时落中断页:明确报「需要绑定辅助邮箱」,不偷偷建 CF 邮箱。"""
+        interrupt_url = "https://account.live.com/interrupt/credentialaction"
+        interrupt_resp = types.SimpleNamespace(
+            status_code=200,
+            text='<html><script>ServerData = {"apiCanary":"C","acmaInitialResponse":{"continuationToken":"T"}};</script></html>',
+            url=interrupt_url, headers={},
+        )
+        login_response = types.SimpleNamespace(
+            status_code=302, headers={"Location": interrupt_url},
+            url="https://login.live.com/ppsecure/post.srf", text="",
+        )
+        session = self._make_fake_session([interrupt_resp], login_response)
+
+        result = web_outlook_app.extract_graph_refresh_token(
+            "foo@outlook.com", "pw", bind_secondary=False, session_factory=lambda: session,
+        )
+
+        self.assertFalse(result["success"])
+        self.assertIn("绑定辅助邮箱", str(result.get("error", "")))
+        self.assertFalse(mock_create.called)
+
+    @patch("web_outlook_app._fetch_latest_code_fallback", return_value=None)
+    @patch("web_outlook_app.create_or_get_address")
+    def test_credentialaction_missing_serverdata_fails(self, mock_create, _mock_fallback):
+        """中断页无 canary/continuationToken → 绑定失败并明确报错(不再静默卡住)。"""
+        mock_create.return_value = {
+            "address": "ms-foo@cf.com", "jwt": "jwt", "password": "", "use_admin": False,
+        }
+        interrupt_url = "https://account.live.com/interrupt/credentialaction"
+        interrupt_resp = types.SimpleNamespace(
+            status_code=200, text='<html><input name="uaid" value="U"/></html>',
+            url=interrupt_url, headers={},
+        )
+        login_response = types.SimpleNamespace(
+            status_code=302, headers={"Location": interrupt_url},
+            url="https://login.live.com/ppsecure/post.srf", text="",
+        )
+        session = self._make_fake_session([interrupt_resp], login_response)
+
+        result = web_outlook_app.extract_graph_refresh_token(
+            "foo@outlook.com", "pw", bind_secondary=True, session_factory=lambda: session,
+        )
+
+        self.assertFalse(result["success"])
+        self.assertIn("绑定", str(result.get("error", "")) + str(result.get("details", "")))
+
+    def test_createfido_skip_posts_urlpost_with_cancel(self):
+        """CreateFido 页:Skip = POST urlPost + canary + error_code=Cancel + i19=3。"""
+        fido_cfg = (
+            '<script>$Config = {"urlPost":"https://login.microsoft.com/consumers/fido/create",'
+            '"sCanary":"FIDO-CANARY","sFidoChallenge":"x"};</script>'
+        )
+        fido_resp = types.SimpleNamespace(
+            status_code=200, text=fido_cfg,
+            url="https://login.microsoft.com/consumers/fido/create", headers={},
+        )
+        localhost_resp = types.SimpleNamespace(
+            status_code=200, text="", url="http://localhost/?code=FIDOCODE", headers={},
+        )
+        login_response = types.SimpleNamespace(
+            status_code=302, headers={"Location": fido_resp.url},
+            url="https://login.live.com/ppsecure/post.srf", text="",
+        )
+        session = self._make_fake_session([fido_resp, localhost_resp], login_response)
+        captured = {}
+        original_post = session.post
+
+        def routed_post(url, data=None, **kwargs):
+            if "fido/create" in str(url):
+                captured["url"] = url
+                captured["data"] = data or {}
+                captured["kwargs"] = kwargs
+                return localhost_resp
+            return original_post(url, data=data, **kwargs)
+
+        session.post = routed_post
+
+        result = web_outlook_app.extract_graph_refresh_token(
+            "foo@outlook.com", "pw", session_factory=lambda: session,
+        )
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(captured["data"].get("canary"), "FIDO-CANARY")
+        self.assertEqual(captured["data"].get("error_code"), "Cancel")
+        self.assertEqual(captured["data"].get("i19"), "3")
+        self.assertFalse(captured["kwargs"].get("allow_redirects", True))
+
+    def test_fido_create_bouncer_posts_action_absolute(self):
+        """fido/create 自动提交跳板:action 是相对路径时补全域名后 POST。"""
+        bouncer_html = (
+            "<html onload=\"document.forms[0].submit()\">"
+            "<form action='/consumers/fido/create?x=1'>"
+            '<input name="a" value="b&quot;c"/></form></html>'
+        )
+        bouncer_url = "https://login.microsoft.com/consumers/fido/create"
+        bouncer_resp = types.SimpleNamespace(
+            status_code=200, text=bouncer_html, url=bouncer_url, headers={},
+        )
+        localhost_resp = types.SimpleNamespace(
+            status_code=200, text="", url="http://localhost/?code=BOUNCER", headers={},
+        )
+        login_response = types.SimpleNamespace(
+            status_code=302, headers={"Location": bouncer_url},
+            url="https://login.live.com/ppsecure/post.srf", text="",
+        )
+        session = self._make_fake_session([bouncer_resp, localhost_resp], login_response)
+        captured = {}
+        original_post = session.post
+
+        def routed_post(url, data=None, **kwargs):
+            if "fido/create" in str(url) and "consumers" in str(url):
+                captured["url"] = url
+                captured["data"] = data or {}
+                return localhost_resp
+            return original_post(url, data=data, **kwargs)
+
+        session.post = routed_post
+
+        result = web_outlook_app.extract_graph_refresh_token(
+            "foo@outlook.com", "pw", session_factory=lambda: session,
+        )
+
+        self.assertTrue(result["success"], result)
+        # action 相对路径 -> 补全为 fido/create 自身域名下的绝对 URL
+        self.assertEqual(
+            captured["url"], "https://login.microsoft.com/consumers/fido/create?x=1"
+        )
+        # hidden value 已 HTML 反转义
+        self.assertEqual(captured["data"].get("a"), 'b"c')
+
+    def test_app_confirm_follows_success_url(self):
+        """App/Confirm 页:GET successUrl 并还原 \\u0026 转义。"""
+        confirm_url = "https://login.microsoft.com/consumers/App/Confirm?ctx=1"
+        confirm_html = ('<script>{"successUrl":"https:\\u002f\\u002flogin.microsoft.com'
+                        '\\u002fok?res=success"}</script>')
+        confirm_resp = types.SimpleNamespace(
+            status_code=200, text=confirm_html, url=confirm_url, headers={},
+        )
+        localhost_resp = types.SimpleNamespace(
+            status_code=200, text="", url="http://localhost/?code=CONFIRM", headers={},
+        )
+        login_response = types.SimpleNamespace(
+            status_code=302, headers={"Location": confirm_url},
+            url="https://login.live.com/ppsecure/post.srf", text="",
+        )
+        session = self._make_fake_session([confirm_resp, localhost_resp], login_response)
+        result = web_outlook_app.extract_graph_refresh_token(
+            "foo@outlook.com", "pw", session_factory=lambda: session,
+        )
+
+        self.assertTrue(result["success"], result)
+        followed = [str(c[0]) for c in session.get_calls if "res=success" in str(c[0])]
+        self.assertEqual(len(followed), 1)
+        self.assertNotIn("\\u0026", followed[0])
+        self.assertNotIn("\\u002f", followed[0])
+
+    def test_app_confirm_without_success_url_fails(self):
+        """App/Confirm 页无 successUrl → 明确失败。"""
+        confirm_url = "https://login.microsoft.com/consumers/App/Confirm"
+        confirm_resp = types.SimpleNamespace(
+            status_code=200, text="<html>no url here</html>", url=confirm_url, headers={},
+        )
+        login_response = types.SimpleNamespace(
+            status_code=302, headers={"Location": confirm_url},
+            url="https://login.live.com/ppsecure/post.srf", text="",
+        )
+        session = self._make_fake_session([confirm_resp], login_response)
+        result = web_outlook_app.extract_graph_refresh_token(
+            "foo@outlook.com", "pw", session_factory=lambda: session,
+        )
+
+        self.assertFalse(result["success"])
+        self.assertIn("App/Confirm", str(result.get("error", "")) + str(result.get("details", "")))
+
+    def test_consent_update_accepts_new_scope_shape(self):
+        """Consent/Update 新版(2026-09):无 sCanary/sRawInputScopes,scope 在
+        arrConsentInfoServerData 里 —— 不能提交空 scope,否则 AAD 报 900144。"""
+        html = (
+            '<script>ServerData = {"sClientId":"CID",'
+            '"arrConsentInfoServerData":[{"arrScopes":[{"id":"scope-a"},{"id":"scope-b"}]}]};</script>'
+        )
+        captured = {}
+
+        class S:
+            def post(self, url, data=None, **kwargs):
+                captured["url"] = url
+                captured["data"] = data or {}
+                return "RESP"
+
+        resp = web_outlook_app.handle_consent_update(
+            S(), html, "https://account.live.com/Consent/Update?id=1",
+        )
+
+        self.assertEqual(resp, "RESP")
+        self.assertEqual(captured["data"]["ucaction"], "Yes")
+        self.assertEqual(captured["data"]["client_id"], "CID")
+        self.assertEqual(captured["data"]["cscope"], "scope-a scope-b")
+
+    def test_consent_update_legacy_shape_uses_canary(self):
+        """旧版 Consent/Update:sCanary + sRawInputScopes 原样提交。"""
+        html = (
+            '<script>ServerData = {"sClientId":"CID","sRawInputScopes":"sc1",'
+            '"sRawInputGrantedScopes":"sc2","sCanary":"CAN"};</script>'
+        )
+        captured = {}
+
+        class S:
+            def post(self, url, data=None, **kwargs):
+                captured["data"] = data or {}
+                return "RESP"
+
+        self.assertEqual(
+            web_outlook_app.handle_consent_update(S(), html, "https://account.live.com/Consent/Update"),
+            "RESP",
+        )
+        self.assertEqual(captured["data"]["canary"], "CAN")
+        self.assertEqual(captured["data"]["scope"], "sc1")
+        self.assertEqual(captured["data"]["cscope"], "sc2")
+
+    def test_consent_update_without_server_data_returns_none(self):
+        """无 ServerData → None(由调用方报「同意页面处理失败」)。"""
+        self.assertIsNone(
+            web_outlook_app.handle_consent_update(
+                object(), "<html>no server data</html>", "https://account.live.com/Consent/Update",
+            )
+        )
+
+    def test_parse_server_data_survives_nested_braces(self):
+        """ServerData 值里带嵌套 {}(acmaInitialResponse 等),非贪婪正则会被截断,
+        必须靠平衡括号兜底还原出完整 JSON。"""
+        html = (
+            '<script>ServerData = {"apiCanary":"C",'
+            '"acmaInitialResponse":{"continuationToken":"T","nested":{"a":1}}};</script>'
+        )
+        sd = web_outlook_app.parse_server_data(html)
+        self.assertEqual(sd["apiCanary"], "C")
+        self.assertEqual(sd["acmaInitialResponse"]["continuationToken"], "T")
+        self.assertEqual(sd["acmaInitialResponse"]["nested"]["a"], 1)
+
+    def test_is_oauth_code_redirect_ignores_encoded_redirect_uri(self):
+        """authorize URL 里 redirect_uri 编码含 localhost、response_type=code 含 "code=",
+        子串判定会把它误当「已回到 redirect_uri 并拿到码」→ 空响应死循环到「授权流程卡住」。"""
+        encoded = (
+            "https://login.live.com/oauth20_authorize.srf?client_id=x"
+            "&redirect_uri=http%3a%2f%2flocalhost%3a8080&response_type=code"
+        )
+        self.assertFalse(web_outlook_app.is_oauth_code_redirect(encoded))
+        # 形如微软中间页、query 里只有 code 相关字面但不含 code/error 参数
+        self.assertFalse(web_outlook_app.is_oauth_code_redirect(
+            "https://login.live.com/oauth20_authorize.srf?issuer=mso&code_challenge=x"))
+        # 真正回到 redirect_uri 且 query 里有 code/error 参数才算终点
+        self.assertTrue(web_outlook_app.is_oauth_code_redirect("http://localhost:8080/?code=ABC"))
+        self.assertTrue(web_outlook_app.is_oauth_code_redirect("http://localhost/?code=ABC"))
+        self.assertTrue(web_outlook_app.is_oauth_code_redirect("http://127.0.0.1:8080/?code=ABC"))
+        self.assertTrue(web_outlook_app.is_oauth_code_redirect("/?code=ABC"))
+        self.assertTrue(web_outlook_app.is_oauth_code_redirect("?code=ABC"))
+        self.assertTrue(web_outlook_app.is_oauth_code_redirect("http://localhost/?error=denied"))
+        self.assertFalse(web_outlook_app.is_oauth_code_redirect(""))
+        self.assertFalse(web_outlook_app.is_oauth_code_redirect("http://localhost:8080/"))
+        # 非 localhost 主机上带 code 参数不是我们的回调
+        self.assertFalse(web_outlook_app.is_oauth_code_redirect("https://evil.com/?code=ABC"))
+
+    def test_post_bind_reauth_follows_intermediate_redirects_to_code(self):
+        """绑辅助邮箱后重新 GET authorize:微软先 302 到 login.live.com/oauth20_authorize.srf
+        (URL 里 redirect_uri 编码含 localhost),必须继续跟到真正的 ?code=。"""
+        interrupt_url = "https://account.live.com/interrupt/credentialaction"
+        interrupt_resp = types.SimpleNamespace(
+            status_code=200,
+            text=('<html><input name="uaid" value="U"/>'
+                  '<script>ServerData = {"apiCanary":"C",'
+                  '"acmaInitialResponse":{"continuationToken":"T"}};</script></html>'),
+            url=interrupt_url, headers={},
+        )
+        # 绑定后 GET authorize 的 302:Location 里的 redirect_uri 是编码过的
+        # (http%3a%2f%2flocalhost%3a8080),且带 response_type=code(=字面出现 "code=")。
+        # 子串判定会把它当成「已回到 redirect_uri 并拿到码」→ 空响应空转到「授权流程卡住」。
+        mid_loc = ("https://login.live.com/oauth20_authorize.srf?client_id=x"
+                   "&redirect_uri=http%3a%2f%2flocalhost%3a8080&response_type=code")
+        mid_resp = types.SimpleNamespace(
+            status_code=302, headers={"Location": mid_loc},
+            url="https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize", text="",
+        )
+        # 跟到 mid_loc 后才拿到真正的回调 302
+        code_resp = types.SimpleNamespace(
+            status_code=302, headers={"Location": "http://localhost:8080/?code=REALCODE"},
+            url=mid_loc, text="",
+        )
+        login_response = types.SimpleNamespace(
+            status_code=302, headers={"Location": interrupt_url},
+            url="https://login.live.com/ppsecure/post.srf", text="",
+        )
+        email_api_resp = types.SimpleNamespace(
+            status_code=200, text="", headers={}, json=lambda: {"state": "verify"},
+        )
+        activate_resp = types.SimpleNamespace(status_code=200, text="", headers={})
+
+        session = self._make_fake_session([interrupt_resp, mid_resp, code_resp], login_response)
+        original_post = session.post
+
+        def routed_post(url, data=None, **kwargs):
+            if url.endswith("/auth/methods/email"):
+                return email_api_resp
+            if url.endswith("/auth/methods/email/activate"):
+                return activate_resp
+            return original_post(url, data=data, **kwargs)
+
+        session.post = routed_post
+
+        with patch("web_outlook_app.create_or_get_address",
+                   return_value={"address": "ms-foo@cf.com", "jwt": "jwt",
+                                 "password": "auxpw", "use_admin": False}), \
+             patch("web_outlook_app.fetch_admin_mails", return_value=[{"id": 7}]), \
+             patch("web_outlook_app.wait_for_code", return_value="123456"), \
+             patch("web_outlook_app._fetch_latest_code_fallback", return_value=None):
+            result = web_outlook_app.extract_graph_refresh_token(
+                "foo@outlook.com", "pw", bind_secondary=True, session_factory=lambda: session,
+            )
+
+        # 关键:中间页(redirect_uri 编码含 localhost + response_type=code)不能被当成终点,
+        # 必须继续跟到真正的 ?code= 回调。旧代码会在这里 make_light_response 后
+        # 反复消费同一个 hop → 空转到「授权流程卡住」。
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["refresh_token"], "rt")
+        # 必须真的 GET 了那个中间页(而不是把它当终点、空转同一 hop)
+        self.assertTrue(any("oauth20_authorize.srf?client_id=x" in str(c[0])
+                            for c in session.get_calls), session.get_calls)
+
+    def test_unescape_form_fields_decodes_html_entities(self):
+        """DoSubmit 表单 hidden value 必须反转义后再提交。"""
+        html = '<input name="scenarios" value="[{&quot;a&quot;:&amp;b}]"/>'
+        decoded = web_outlook_app._unescape_form_fields(html)
+        self.assertEqual(decoded["scenarios"], '[{"a":&b}]')
+        # 原 extract_hidden_inputs 行为不变(不反转义)
+        raw = web_outlook_app.extract_hidden_inputs(html)
+        self.assertEqual(raw["scenarios"], '[{&quot;a&quot;:&amp;b}]')
+
+    def test_unescape_form_fields_keeps_first_duplicate(self):
+        """同名 input 保留首个(对齐上游 reg-factory 语义)。"""
+        html = '<input name="canary" value="first"/><input name="canary" value="second"/>'
+        self.assertEqual(web_outlook_app._unescape_form_fields(html)["canary"], "first")
+
+    def test_parses_interrupt_pages_from_synthetic_fixture(self):
+        """用合成 fixture 复核新落点的页面特征串是否稳定命中判定条件。"""
+        # interrupt 页:ServerData 必须能被非贪婪 + 平衡括号解析出 canary/continuationToken
+        server_data = (
+            'ServerData = {"apiCanary":"C","acmaInitialResponse":{"continuationToken":"T"}};'
+        )
+        m = re.search(r'ServerData\s*=\s*(\{.*?\});', server_data, re.DOTALL)
+        self.assertIsNotNone(m)
+        sd = json.loads(m.group(1))
+        self.assertEqual(sd["apiCanary"], "C")
+        self.assertEqual(sd["acmaInitialResponse"]["continuationToken"], "T")
+        # CreateFido:$Config 的平衡 JSON 提取(值里含 } 也不截断)
+        cfg_raw = '{"urlPost":"https://x/y","sCanary":"c","nested":{"a":1}}'
+        self.assertEqual(
+            web_outlook_app._parse_cfg_json_balanced(cfg_raw + "tail"), cfg_raw
+        )
+        # App/Confirm:successUrl 还原
+        html = '"successUrl":"https:\\u002f\\u002fa?x=1\\u0026res=success"'
+        m2 = re.search(r'"successUrl"\s*:\s*"([^"]+)"', html)
+        self.assertIsNotNone(m2)
+        url = m2.group(1).replace("\\u0026", "&").replace("\\u002f", "/")
+        self.assertEqual(url, "https://a?x=1&res=success")
 
 
 class BatchAuthorizeApiTests(unittest.TestCase):

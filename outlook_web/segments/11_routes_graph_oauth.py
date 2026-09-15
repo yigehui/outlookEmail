@@ -41,6 +41,10 @@ GRAPH_CLIENT_ID = OAUTH_CLIENT_ID
 GRAPH_REDIRECT_URI = OAUTH_REDIRECT_URI
 GRAPH_SCOPE = GRAPH_EXTRACT_SCOPE
 
+# 授权主循环步数上限：登录/绑定后的重定向链会夹多张 Consent/DoSubmit 跳板页，
+# 每跳算一步。记在模块级便于按实测调整与测试覆盖。
+MAX_OAUTH_STEPS = int(os.getenv("GRAPH_OAUTH_MAX_STEPS", "40"))
+
 GRAPH_OAUTH_TASKS: Dict[str, Dict[str, Any]] = {}
 GRAPH_OAUTH_DONE = object()
 
@@ -90,6 +94,30 @@ def build_graph_authorize_url(client_id: str, redirect_uri: str, scope: str,
     )
 
 
+def is_oauth_code_redirect(loc: str) -> bool:
+    """Location 是否已回到 redirect_uri 并带上授权码/错误。
+
+    判定必须解析 query 参数名,不能做子串判断:
+    - `"localhost" in loc` 会把微软中间跳转误判成终点 —— authorize URL 里
+      redirect_uri 是 URL 编码的(http%3a%2f%2flocalhost%3a8080),字面就含 localhost;
+    - `"code=" in loc` 同样误判 —— `response_type=code&...` 字面含 "code="。
+    两者叠加 → 拿空响应体死循环到「授权流程卡住」。2026-09 绑辅助邮箱后重新授权时
+    踩到的真坑；按参数判定后,中间跳转会被继续跟下去,而不是当成终点。
+    """
+    text = str(loc or "").strip()
+    if not text:
+        return False
+    if not re.match(r'^(https?://|/|\?)', text):
+        return False
+    parts = urllib.parse.urlsplit(text)
+    params = urllib.parse.parse_qs(parts.query)
+    if "code" not in params and "error" not in params:
+        return False
+    host = parts.netloc.split("@")[-1].split(":")[0].lower()
+    # 相对 Location(/?code=…)没有 host,视为回到 redirect_uri
+    return host in ("localhost", "127.0.0.1") if host else True
+
+
 def make_light_response(url: str, text: str = "", status_code: int = 200):
     return type("GraphOauthResponse", (), {
         "url": url,
@@ -110,6 +138,26 @@ def extract_hidden_inputs(html: str) -> Dict[str, str]:
     }
 
 
+def _unescape_form_fields(html: str) -> Dict[str, str]:
+    """取表单 hidden 字段并做 HTML 反转义。
+
+    DoSubmit(fmHF) 表单的 hidden value 是 HTML 转义的（&quot; &amp; &#39; 等），
+    浏览器提交前会解码；纯 HTTP 必须先 unescape 再发，否则服务端收到坏 JSON
+    （scenarios 字段被破坏）→ 302 oauth server_error。2026-09 发现的主坑。
+    同名 input 保留首个（与 extract_hidden_inputs 的 dict 覆盖语义不同，对齐上游）。
+    """
+    import html as _html
+    out: Dict[str, str] = {}
+    for name, value in re.findall(
+        r'<input[^>]*name="([^"]*)"[^>]*value="([^"]*)"',
+        str(html or ""),
+    ):
+        if name in out:
+            continue
+        out[name] = _html.unescape(value)
+    return out
+
+
 def absolute_form_action(action: str, current_url: str) -> str:
     action = (action or "").replace("&amp;", "&")
     if action.startswith("http"):
@@ -119,6 +167,296 @@ def absolute_form_action(action: str, current_url: str) -> str:
         return f"{base.scheme}://{base.netloc}{action}"
     path = urllib.parse.urljoin(f"{base.scheme}://{base.netloc}{base.path}", action)
     return path
+
+
+def parse_server_data(html: str) -> Dict[str, Any]:
+    """解析页面里的 `ServerData = {...};`（非贪婪 + 括号平衡兜底），失败返回 {}。"""
+    raw = str(html or "")
+    match = re.search(r'ServerData\s*=\s*(\{.*?\});', raw, re.DOTALL)
+    if not match:
+        return {}
+    for candidate in (match.group(1), _parse_cfg_json_balanced(match.group(1))):
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def handle_consent_update(session, text: str, current_url: str, log=None):
+    """Consent/Update 同意页：用 canary/scope 接受。返回响应；无 ServerData 返回 None。
+
+    两种页面形态：
+    - 老形态：写 `ucaction` + `sClientId`/`sRawInputScopes`/`sCanary`；
+    - 2026-09 绑辅助邮箱(id=293577)之后的新形态：ServerData 里是
+      `arrConsentInfoServerData`（无 sCanary/sRawInputScopes），必须补上
+      `sRawInputGrantedScopes`（取首个 scope 的 id)并把 `sCanary` 置空，
+      否则页面下发的空 scope 会把已授权 scope 覆盖掉 → AAD 回 900144 bad request。
+    """
+    sd = parse_server_data(text)
+    if not sd:
+        return None
+    graph_oauth_log(log, "接受 Outlook 授权同意页面")
+    consent_form = {
+        "ucaction": "Yes",
+        "client_id": sd.get("sClientId", ""),
+        "scope": sd.get("sRawInputScopes", ""),
+        "cscope": sd.get("sRawInputGrantedScopes", ""),
+        "canary": sd.get("sCanary", ""),
+    }
+    consent_info = sd.get("arrConsentInfoServerData")
+    if sd.get("sCanary") in (None, "") and consent_info:
+        raw_scopes = ""
+        if isinstance(consent_info, list) and consent_info:
+            client = consent_info[0] if isinstance(consent_info[0], dict) else {}
+            scopes = client.get("arrScopes") or client.get("arrRawScopes") or []
+            if isinstance(scopes, list):
+                raw_scopes = " ".join(
+                    str(s.get("id") or s.get("scope") or "").strip()
+                    for s in scopes if isinstance(s, dict)
+                ).strip()
+        consent_form["cscope"] = raw_scopes
+    resp = session.post(current_url, data=consent_form, timeout=30, allow_redirects=False)
+    return resp
+
+
+def is_dosubmit_bouncer(html: str) -> bool:
+    """是否是微软的 DoSubmit(fmHF) 自动提交跳板页(登录后 / 绑定后的「Continue」页)。"""
+    text = str(html or "")
+    return ("DoSubmit" in text or ("fmHF" in text and "onload" in text)) and "action" in text
+
+
+def submit_dosubmit_bouncer(session, html: str, url: str, log=None):
+    """提交 DoSubmit(fmHF) 自动提交跳板页,返回响应;找不到 action 返回 None。
+
+    hidden value 必须先 HTML 反转义(_unescape_form_fields),否则服务端收到坏 JSON
+    → 302 oauth server_error(2026-09 发现的主坑)。
+    """
+    match = re.search(r"""action\s*=\s*["']([^"']+)["']""", str(html or ""))
+    if not match:
+        return None
+    graph_oauth_log(log, "处理 Microsoft 中间自动提交页面")
+    return session.post(
+        absolute_form_action(match.group(1), url),
+        data=_unescape_form_fields(html),
+        timeout=30,
+        allow_redirects=False,
+    )
+
+
+def _parse_cfg_json_balanced(raw: str) -> str:
+    """从 $Config= 或 ServerData= 后的文本提取平衡 JSON（处理转义不破坏结构）。"""
+    depth = 0
+    instr = False
+    esc = False
+    for i, ch in enumerate(raw):
+        if esc:
+            esc = False
+            continue
+        if ch == '\\':
+            esc = True
+            continue
+        if ch == '"':
+            instr = not instr
+            continue
+        if instr:
+            continue
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return raw[:i + 1]
+    return raw
+
+
+def _skip_createfido(session, text: str, url: str, idx: int = 0,
+                     log: Optional[Callable[[str], None]] = None):
+    """CreateFido 页（强制 passkey 注册）纯协议跳过。
+
+    JS 逻辑（ConvergedCreateFido_Core）：Skip 按钮 → form POST 到 $Config.urlPost，
+    字段 canary($Config.sCanary) + error_code="Cancel" + i19。
+    成功 → 302 回 oauth20_authorize；失败（未过 fido/create 状态）→ errcode=1078。
+    返回响应；无 $Config / 无 urlPost 时返回 None（调用方继续走通用表单分支）。
+    """
+    m_cfg = re.search(r'\$Config\s*=\s*(\{.*?\});', str(text or ""), re.DOTALL)
+    if not m_cfg:
+        return None
+    try:
+        cfg = json.loads(_parse_cfg_json_balanced(m_cfg.group(1)))
+    except Exception:
+        return None
+    url_post = str(cfg.get("urlPost", "") or "").replace("\\u0026", "&").replace("&amp;", "&")
+    if not url_post:
+        return None
+    resp = session.post(
+        url_post,
+        data={"canary": cfg.get("sCanary", ""), "error_code": "Cancel", "i19": "3"},
+        timeout=30,
+        allow_redirects=False,
+        headers={
+            "Referer": url,
+            "Origin": "https://login.microsoft.com",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "cross-site",
+            "Sec-Fetch-User": "?F0D1",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    graph_oauth_log(
+        log,
+        f"[#{idx}] CreateFido skip -> {resp.status_code} "
+        f"{(resp.headers.get('Location') or '')[:90]}",
+    )
+    return resp
+
+
+def _resolve_bind_secondary(email: str, recovery_email: str, recovery_password: str,
+                            log: Optional[Callable[[str], None]] = None) -> Optional[Dict[str, Any]]:
+    """解析本号要绑的 CF 辅助邮箱，返回 {cf_address, cf_jwt, use_admin, cf_password}。
+
+    优先用导入时带的辅助邮箱（recovery_email，收码走 CF admin API），
+    否则 create_or_get_address 自动分配 ms-<前缀>@<CF域名>。
+    失败返回 None（调用方回退 Skip 或不绑，不阻断授权）。
+    """
+    recovery_email = str(recovery_email or '').strip()
+    if recovery_email:
+        graph_oauth_log(log, f"使用导入的辅助邮箱绑定: {recovery_email}")
+        return {
+            "cf_address": recovery_email,
+            "cf_jwt": None,
+            "use_admin": True,
+            "cf_password": str(recovery_password or ''),
+        }
+    try:
+        cf_info = create_or_get_address(email)
+    except Exception as exc:
+        graph_oauth_log(log, f"CF 辅助邮箱分配失败，回退 Skip: {exc}")
+        return None
+    cf_address = cf_info.get("address")
+    if not cf_address:
+        return None
+    return {
+        "cf_address": cf_address,
+        "cf_jwt": cf_info.get("jwt"),
+        "use_admin": cf_info.get("use_admin", False),
+        "cf_password": cf_info.get("password") or "",
+    }
+
+
+def _bind_credentialaction_in_session(session, html: str, url: str, email: str, *,
+                                      bind_secondary: Any = None, idx: int = 0,
+                                      log: Optional[Callable[[str], None]] = None,
+                                      max_wait: int = 150, poll: int = 4):
+    """credentialaction 中断页（mode=mpb）纯协议绑定辅助邮箱。
+
+    2026-09 起未绑辅助邮箱的号登录后落到此页（老 proofs/Add 链路已废）。
+    页面 ServerData：acmaInitialResponse.continuationToken + apiCanary。
+    POST api/v1.0/auth/methods/email → CF 收码 → POST .../activate（200=绑定成功）。
+    成功返回 True；失败返回 None。
+    """
+    tag = f"[#{idx}]"
+    m_sd = re.search(r'ServerData\s*=\s*(\{.*?\});', str(html or ""), re.DOTALL)
+    if not m_sd:
+        graph_oauth_log(log, f"{tag} bind_ca: 无 ServerData，无法绑定")
+        return None
+    try:
+        sd = json.loads(m_sd.group(1))
+    except Exception:
+        graph_oauth_log(log, f"{tag} bind_ca: ServerData 解析失败")
+        return None
+    canary = sd.get("apiCanary", "")
+    cont_token = str((sd.get("acmaInitialResponse") or {}).get("continuationToken", "") or "")
+    if not canary or not cont_token:
+        graph_oauth_log(log, f"{tag} bind_ca: canary/continuationToken 缺失，无法绑定")
+        return None
+
+    # uaid：页面 hidden input（DoSubmit 表单里），作 correlationId 用
+    uaid = _unescape_form_fields(html).get("uaid", "")
+
+    # CF 辅助邮箱：调用方给了就直接用，否则现场分配
+    bs = bind_secondary
+    if bs and not isinstance(bs, dict):
+        bs = None
+    cf_address = str((bs or {}).get("cf_address") or "")
+    cf_jwt = (bs or {}).get("cf_jwt")
+    use_admin = bool((bs or {}).get("use_admin", False))
+    if not cf_address:
+        info = _resolve_bind_secondary(email, '', '', log)
+        if not info:
+            graph_oauth_log(log, f"{tag} bind_ca: 无可用 CF 辅助邮箱")
+            return None
+        cf_address = info["cf_address"]
+        cf_jwt = info["cf_jwt"]
+        use_admin = info["use_admin"]
+    graph_oauth_log(log, f"{tag} bind_ca: 绑定辅助邮箱 {cf_address}")
+
+    h_api = {
+        "Accept": "application/json",
+        "canary": canary,
+        "correlationId": uaid,
+        "client-request-id": uaid,
+        "Content-Type": "application/json",
+        "Referer": "https://account.live.com/interrupt/credentialaction",
+        "Origin": "https://account.live.com",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+    }
+    resp1 = session.post(
+        "https://account.live.com/api/v1.0/auth/methods/email",
+        json={"email": cf_address, "continuationToken": cont_token},
+        headers=h_api,
+        timeout=30,
+    )
+    try:
+        jd1 = resp1.json() if resp1.status_code in (200, 201) else {}
+    except Exception:
+        jd1 = {}
+    graph_oauth_log(log, f"{tag} bind_ca: POST email -> {resp1.status_code} state={jd1.get('state', '')}")
+    if jd1.get("error") or resp1.status_code not in (200, 201):
+        graph_oauth_log(log, f"{tag} bind_ca: email API 失败 {str(jd1)[:150]}")
+        return None
+    if jd1.get("apiCanary"):
+        h_api["canary"] = jd1["apiCanary"]
+
+    # CF 收码：先取基线 id，只取基线之后的新邮件
+    base_id = 0
+    try:
+        if use_admin:
+            raws = fetch_admin_mails(cf_address, limit=20)
+            base_id = max([m.get("id", 0) for m in raws] or [0])
+        else:
+            mails = fetch_parsed_mails(cf_jwt, limit=20)
+            base_id = max([m.get("id", 0) for m in mails] or [0])
+    except Exception as exc:
+        graph_oauth_log(log, f"{tag} bind_ca: 取 CF 基线失败（继续）: {exc}")
+
+    code = wait_for_code(cf_jwt, received_after_id=base_id, max_wait=max_wait, poll=poll,
+                         use_admin=use_admin, address=cf_address)
+    if not code:
+        code = _fetch_latest_code_fallback(cf_address, cf_jwt, use_admin)
+    if not code:
+        graph_oauth_log(log, f"{tag} bind_ca: CF 取码超时")
+        return None
+    graph_oauth_log(log, f"{tag} bind_ca: 取到验证码 {code}")
+
+    resp2 = session.post(
+        "https://account.live.com/api/v1.0/auth/methods/email/activate",
+        json={
+            "activationDetails": {"displayName": cf_address, "id": cf_address, "otp": code},
+            "otp": code,
+            "continuationToken": cont_token,
+        },
+        headers=h_api,
+        timeout=30,
+    )
+    ok = resp2.status_code in (200, 201)
+    graph_oauth_log(log, f"{tag} bind_ca: activate -> {resp2.status_code} {'OK' if ok else str(getattr(resp2, 'text', '') or '')[:120]}")
+    return True if ok else None
 
 
 def extract_graph_refresh_token(
@@ -138,11 +476,17 @@ def extract_graph_refresh_token(
 ) -> Dict[str, Any]:
     """使用纯 HTTP OAuth2 授权码流程提取 Outlook refresh_token。
 
-    bind_secondary 真值时,流程到达 proofs/Add 会尝试绑定辅助邮箱：
+    bind_secondary 真值时,流程到达需要绑辅助邮箱的页面会真绑（而非 Skip）：
+    - proofs/Add（老链路）：bind_proof_in_session 填表 → CF 收码 → VerifyProof。
+    - interrupt/credentialaction（2026-09 新链路，未绑号登录后落到此页）：
+      _bind_credentialaction_in_session 走 auth/methods/email + activate 纯协议绑定。
     - recovery_email 非空（导入带了辅助邮箱）：直接用该地址绑定,跳过 CF 建邮箱,
       收码走 CF admin API（需 CF 渠道）；recovery_password 作为辅助邮箱密码回传。
-    - 否则：create_or_get_address 建 CF 临时邮箱绑定。
+    - 否则：create_or_get_address 建 CF 临时邮箱（ms-<前缀>@<CF域名>）绑定。
     成功后 recovery_email/recovery_email_password 随成功 dict 返回,由调用方透传给 upsert。
+
+    流程还会纯协议处理 passkey 强制页（fido/create 跳板 + CreateFido Skip）与
+    App/Confirm 页（GET successUrl）。
     """
     _pending_recovery_email = ""
     _pending_recovery_password = ""
@@ -169,11 +513,8 @@ def extract_graph_refresh_token(
         log_outbound_proxy_usage(f'Outlook自动授权 {email}', resolved_proxy or '')
         if resolved_proxy:
             graph_oauth_log(log, f"OAuth 全程固定代理: {format_proxy_for_log(resolved_proxy)}")
-        resp = session.get(
-            build_graph_authorize_url(client_id, redirect_uri, scope, authority),
-            timeout=30,
-            allow_redirects=True,
-        )
+        auth_url = build_graph_authorize_url(client_id, redirect_uri, scope, authority)
+        resp = session.get(auth_url, timeout=30, allow_redirects=True)
         text = resp.text or ""
 
         flow_token = ""
@@ -269,100 +610,138 @@ def extract_graph_refresh_token(
                         f"提交凭据后返回了登录表单，通常表示{error_hint}。请手动登录 https://outlook.live.com 确认账号状态。"
                     )
 
-        for _ in range(5):
+        # 登录后的重定向链可能夹着若干 DoSubmit 自动提交跳板页(Continue)，
+        # 每跳一次算一步，故按「已提交次数」计上限而不是只试 5 次。
+        for _ in range(MAX_OAUTH_STEPS):
             html = resp2.text or ""
-            if ("DoSubmit" in html or ("fmHF" in html and "onload" in html)) and "action=" in html:
-                form_action_match = re.search(r'action="([^"]+)"', html)
-                if form_action_match:
-                    form_action = form_action_match.group(1).replace("&amp;", "&")
-                    graph_oauth_log(log, "处理 Microsoft 中间自动提交页面")
-                    resp2 = session.post(
-                        form_action,
-                        data=extract_hidden_inputs(html),
-                        timeout=30,
-                        allow_redirects=False,
-                    )
+            if is_dosubmit_bouncer(html):
+                bounced = submit_dosubmit_bouncer(session, html, getattr(resp2, "url", "") or post_url, log)
+                if bounced is not None:
+                    resp2 = bounced
                     continue
             break
 
         auth_code = None
-        for _ in range(15):
+        for _ in range(MAX_OAUTH_STEPS):
             while resp2.status_code in (301, 302, 303, 307):
                 loc = resp2.headers.get("Location", "")
-                if "localhost" in loc:
+                # 只有真正回到 redirect_uri 且带 code=/error= 才算终点；否则继续跟。
+                # 不能用 "localhost" in loc 裸判：authorize URL 里 redirect_uri 是编码过的
+                # (http%3a%2f%2flocalhost%3a8080)，会把微软中间跳转误当终点、拿空响应死循环。
+                if is_oauth_code_redirect(loc):
                     resp2 = make_light_response(loc)
+                    break
+                if not loc:
                     break
                 resp2 = session.get(loc, timeout=30, allow_redirects=False)
 
             current_url = getattr(resp2, "url", "") or ""
             text = resp2.text if getattr(resp2, "text", "") else ""
 
-            if "localhost" in current_url and "code=" in current_url:
+            if is_oauth_code_redirect(current_url):
                 params = urllib.parse.parse_qs(urllib.parse.urlparse(current_url).query)
+                if params.get("error"):
+                    err = params.get("error_description", params.get("error", ["?"]))[0]
+                    return make_graph_oauth_response(False, "OAuth 错误", err)
                 auth_code = params.get("code", [None])[0]
                 if auth_code:
                     graph_oauth_log(log, "已捕获授权码")
                     break
 
-            if "localhost" in current_url and "error" in current_url:
-                params = urllib.parse.parse_qs(urllib.parse.urlparse(current_url).query)
-                err = params.get("error_description", params.get("error", ["?"]))[0]
-                return make_graph_oauth_response(False, "OAuth 错误", err)
+            # DoSubmit(fmHF) 自动提交跳板（登录后 / 绑定后的 "Continue" 页）。
+            # 必须先于 Consent 判定：绑定成功重新 POST authorize 后会先落到
+            # Consent/Update 的跳板壳（HTML 转义 hidden + DoSubmit）上，把这层壳提交掉
+            # 才能看到真正的落点。判定对齐 reg-factory（DoSubmit 或 fmHF+onload）。
+            if is_dosubmit_bouncer(text):
+                bounced = submit_dosubmit_bouncer(session, text, current_url, log)
+                if bounced is not None:
+                    resp2 = bounced
+                    continue
 
             if "Consent/Update" in current_url or "Consent/update" in current_url:
-                server_data = re.search(r'ServerData\s*=\s*(\{.*?\});', text, re.DOTALL)
-                if not server_data:
+                consent_resp = handle_consent_update(session, text, current_url, log)
+                if consent_resp is None:
                     return make_graph_oauth_response(False, "同意页面处理失败", "无法解析 ServerData")
-                graph_oauth_log(log, "接受 Outlook 授权同意页面")
-                sd = json.loads(server_data.group(1))
-                resp2 = session.post(
-                    current_url,
-                    data={
-                        "ucaction": "Yes",
-                        "client_id": sd.get("sClientId", ""),
-                        "scope": sd.get("sRawInputScopes", ""),
-                        "cscope": sd.get("sRawInputGrantedScopes", ""),
-                        "canary": sd.get("sCanary", ""),
-                    },
-                    timeout=30,
-                    allow_redirects=False,
-                )
+                resp2 = consent_resp
                 continue
+
+            if "interrupt/credentialaction" in current_url:
+                # 2026-09 强制中断页：未绑辅助邮箱的号登录后落到此页（老 proofs/Add 链路已废）。
+                # 纯协议绑定：apiCanary+continuationToken → POST auth/methods/email
+                # → CF 收码 → activate → 重新 GET authorize 跟链。
+                if not bind_secondary:
+                    # 用户显式关掉了「绑定辅助邮箱」：不偷偷建 CF 邮箱,明确报出必须先绑。
+                    return make_graph_oauth_response(
+                        False, "需要绑定辅助邮箱",
+                        "账号落到微软强制中断页(credentialaction)，未绑辅助邮箱必须绑定后才能授权；"
+                        "请开启「绑定辅助邮箱」后重试",
+                    )
+                resolved = _resolve_bind_secondary(email, recovery_email, recovery_password, log)
+                ca_bind_ok = _bind_credentialaction_in_session(
+                    session, text, current_url, email,
+                    bind_secondary=resolved, log=log,
+                )
+                if ca_bind_ok is None:
+                    return make_graph_oauth_response(
+                        False, "辅助邮箱绑定失败", "中断页(credentialaction)绑定辅助邮箱未完成"
+                    )
+                if resolved and resolved.get("cf_address"):
+                    _pending_recovery_email = resolved["cf_address"]
+                    _pending_recovery_password = resolved.get("cf_password") or ""
+                # 绑定成功：重新 GET authorize（沿用现有登录态 → 落到 Consent 跳板页）。
+                # 必须用 GET：POST authorize 不带 body 会被 AAD 拒
+                # （AADSTS900144: request body must contain 'client_id'）。
+                # 这一跳大概率直接 302 回 login.live.com/oauth20_authorize，
+                # 循环顶部跟过去后是 DoSubmit(fmHF) 跳板页，由循环顶部的
+                # is_dosubmit_bouncer 处理提交掉，再继续跟到 Consent/授权码。
+                resp2 = session.get(auth_url, timeout=30, allow_redirects=False)
+                continue
+
+            # passkey 强制中断：fido/create 是自动提交跳板，POST 后继续跟链
+            if "fido/create" in text and "onload" in text:
+                fido_action = re.search(r"action='([^']*)'", text)
+                if fido_action:
+                    fido_url = fido_action.group(1).replace("&amp;", "&")
+                    resp2 = session.post(
+                        absolute_form_action(fido_url, current_url),
+                        data=_unescape_form_fields(text),
+                        timeout=30,
+                        allow_redirects=False,
+                    )
+                    graph_oauth_log(log, f"fido/create POST -> {(getattr(resp2, 'url', '') or '')[:100]}")
+                    continue
+
+            # CreateFido 页：Skip = POST urlPost + canary + error_code=Cancel
+            if "CreateFido" in text or ("$Config" in text and "sFidoChallenge" in text):
+                skip_resp = _skip_createfido(session, text, current_url, 0, log)
+                if skip_resp is not None:
+                    resp2 = skip_resp
+                    continue
+
+            # App/Confirm 页：点 Continue → GET successUrl（带 res=success）
+            if "App/Confirm" in current_url:
+                success_match = re.search(r'"successUrl"\s*:\s*"([^"]+)"', text)
+                if success_match:
+                    success_url = success_match.group(1).replace("\\u0026", "&").replace("\\u002f", "/")
+                    success_url = success_url.replace("&amp;", "&")
+                    graph_oauth_log(log, f"App/Confirm -> GET successUrl ...{success_url[-60:]}")
+                    resp2 = session.get(success_url, timeout=30, allow_redirects=False)
+                    continue
+                return make_graph_oauth_response(False, "App/Confirm 处理失败", "页面未找到 successUrl")
 
             if "proofs/Add" in current_url or "proofs/add" in current_url:
                 if bind_secondary:
-                    cf_address = None
-                    cf_jwt = None
-                    cf_pw = ""
-                    use_admin = False
-                    # 优先：导入时带了辅助邮箱，直接用它绑定，跳过 CF 建邮箱。
-                    # 收码仍走 CF admin API（需 CF 渠道配置）。
-                    if recovery_email:
-                        cf_address = recovery_email
-                        cf_jwt = None
-                        cf_pw = recovery_password
-                        use_admin = True
-                        graph_oauth_log(log, f"使用导入的辅助邮箱绑定: {recovery_email}")
-                    else:
-                        try:
-                            cf_info = create_or_get_address(email)
-                            cf_address = cf_info.get("address")
-                            cf_jwt = cf_info.get("jwt")
-                            cf_pw = cf_info.get("password") or ""
-                            use_admin = cf_info.get("use_admin", False)
-                        except Exception as exc:
-                            graph_oauth_log(log, f"CF 辅助邮箱分配失败，回退 Skip: {exc}")
-                            cf_address = None
-                    if cf_address:
+                    resolved = _resolve_bind_secondary(email, recovery_email, recovery_password, log)
+                    if resolved and resolved.get("cf_address"):
                         bound_resp = bind_proof_in_session(
                             session, text, current_url,
-                            cf_address=cf_address, cf_jwt=cf_jwt,
-                            use_admin=use_admin, idx=0,
+                            cf_address=resolved["cf_address"], cf_jwt=resolved.get("cf_jwt"),
+                            use_admin=resolved.get("use_admin", False), idx=0,
                         )
                         if bound_resp is not None:
                             resp2 = bound_resp
-                            _pending_recovery_email = cf_address
-                            _pending_recovery_password = cf_pw
+                            _pending_recovery_email = resolved["cf_address"]
+                            _pending_recovery_password = resolved.get("cf_password") or ""
                             continue
                         graph_oauth_log(log, "bind 失败，回退 Skip proofs/Add")
                 # 回退 / 未启用绑定：原 Skip 逻辑
@@ -374,7 +753,7 @@ def extract_graph_refresh_token(
                 if not form_match:
                     return make_graph_oauth_response(False, "安全信息页面处理失败", "无法找到表单")
                 graph_oauth_log(log, "跳过 Microsoft 安全信息添加页面")
-                form_data = extract_hidden_inputs(form_match.group(2))
+                form_data = _unescape_form_fields(form_match.group(2))
                 form_data["action"] = "Skip"
                 resp2 = session.post(
                     absolute_form_action(form_match.group(1), current_url),
@@ -391,7 +770,7 @@ def extract_graph_refresh_token(
             )
             if form_match:
                 form_action = absolute_form_action(form_match.group(1), current_url)
-                form_data = extract_hidden_inputs(form_match.group(2))
+                form_data = _unescape_form_fields(form_match.group(2))
                 if "consent" in form_action.lower() or "consent" in current_url.lower():
                     graph_oauth_log(log, "提交通用同意表单")
                     form_data["ucaccept"] = "Yes"
@@ -399,7 +778,7 @@ def extract_graph_refresh_token(
                 resp2 = session.post(form_action, data=form_data, timeout=30, allow_redirects=False)
                 while resp2.status_code in (301, 302, 303, 307):
                     loc = resp2.headers.get("Location", "")
-                    if "localhost" in loc:
+                    if is_oauth_code_redirect(loc):
                         resp2 = make_light_response(loc)
                         break
                     if not loc:
