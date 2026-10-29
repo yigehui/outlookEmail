@@ -34,6 +34,10 @@
                                 id="appVersionActionLink" data-default-label="查看更新日志">
                                 查看更新日志
                             </a>
+                            <button class="app-version-link app-version-link--primary" id="appVersionWindowsUpdateBtn"
+                                type="button" onclick="startWindowsUpdate()" hidden>
+                                立即升级
+                            </button>
                             <button class="app-version-link app-version-link--primary" id="appVersionDockerUpdateBtn"
                                 type="button" data-default-label="Docker 更新" data-unavailable-label="不可在线更新"
                                 onclick="startDockerUpdate()" hidden>
@@ -41,9 +45,8 @@
                             </button>
                         </div>
                         <div class="app-version-popover__hint">
-                            仅 Docker 版本支持在线更新，请参考
-                            <a href="https://github.com/assast/outlookEmail#readme" target="_blank" rel="noreferrer">README 中的「启用界面 Docker 在线更新」</a>
-                            进行设置。
+                            Windows 桌面版与启用后的 Docker 部署支持在线更新，其他部署方式请参考
+                            <a href="https://github.com/assast/outlookEmail#readme" target="_blank" rel="noreferrer">README</a>。
                         </div>
                     </div>
                 </div>
@@ -66,6 +69,7 @@
                 操作
             </button>
             <div class="navbar-actions-menu" id="navbarActionsMenu">
+                <button class="navbar-btn" type="button" onclick="showICloudManagement()">iCloud 管理</button>
                 <!-- Mobile only buttons -->
                 <button class="navbar-btn mobile-only-btn" id="refreshTokensBtn" type="button" onclick="showRefreshModal()">Token刷新管理</button>
                 <button class="navbar-btn mobile-only-btn" id="emailShareManagementBtn" type="button" onclick="showEmailShareManagementModal()">分享管理</button>
@@ -78,6 +82,7 @@
                     <span>设置</span>
                 </button>
                 <button class="navbar-btn mobile-only-btn" id="outlookUploadAccountsBtn" type="button" onclick="showOutlookUploadAccountsModal()">Outlook 邮箱</button>
+                <button class="navbar-btn mobile-only-btn" id="projectManagementBtn" type="button" style="display: none;" onclick="showProjectManagementModal()">项目管理</button>
                 <button class="navbar-btn mobile-only-btn" id="logoutBtn" type="button" onclick="logout()">退出登录</button>
                 
                 <button class="navbar-icon-btn desktop-only-btn" id="desktopSettingsBtn" type="button" onclick="showSettingsModal()" title="系统常规设置">
@@ -121,6 +126,7 @@
                     <div class="navbar-dropdown-menu">
                         <button class="dropdown-item" type="button" onclick="showRefreshModal()">Token 刷新管理</button>
                         <button class="dropdown-item" type="button" onclick="showEmailShareManagementModal()">分享管理</button>
+                        <button class="dropdown-item" id="desktopProjectManagementBtn" type="button" style="display: none;" onclick="showProjectManagementModal()">项目管理</button>
                     </div>
                 </div>
                 
@@ -143,6 +149,13 @@
                     <button class="panel-action-btn" id="collapseGroupPanelBtn" onclick="toggleGroupPanelCollapse()" title="折叠分组栏">
                         <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                             <polyline points="11 13 4 8 11 3"></polyline>
+                        </svg>
+                    </button>
+                    <button class="panel-action-btn" id="groupDescriptionVisibilityBtn" onclick="toggleGroupDescriptionVisibility()"
+                        title="显示分组描述" aria-label="切换分组描述展示" aria-pressed="false">
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="2.25" y="2.25" width="11.5" height="11.5" rx="1.5"></rect>
+                            <path d="M5 5.5h6M5 8h6M5 10.5h3.5"></path>
                         </svg>
                     </button>
                     <button class="panel-action-btn" onclick="showAddGroupModal()" title="添加分组">
@@ -175,42 +188,75 @@
                 </div>
 
                 <div class="account-panel-header-actions">
-                    <div class="panel-action-subgroup">
-                        <button class="panel-action-btn account-selection-mode-btn" id="accountSelectionModeBtn"
-                            onclick="toggleAccountSelectionMode()" title="批量选择" aria-pressed="false">
-                            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                                <rect x="2" y="2" width="12" height="12" rx="2"></rect>
-                                <path d="M5 8l2 2 4-4"></path>
+                    <button class="panel-action-btn" id="refreshAccountListBtn" onclick="refreshCurrentAccountList()" title="刷新邮箱列表">
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M1 8a7 7 0 0 1 13.22-3.22M15 8a7 7 0 0 1-13.22 3.22"/>
+                            <path d="M14 1v3.5H10.5M2 15v-3.5h3.5"/>
+                        </svg>
+                    </button>
+                    <button class="panel-action-btn panel-action-btn-accent" onclick="showGetRefreshTokenModal()" title="授权并保存 Outlook 账号">
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="5.5" cy="10.5" r="3.5"></circle>
+                            <path d="M8 8l5-5M13 3h2v2M11 5h2v2"></path>
+                        </svg>
+                    </button>
+                    <button class="panel-action-btn panel-action-btn-primary" onclick="showAddAccountModal()" title="导入邮箱账号">
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                            <path fill-rule="evenodd"
+                                d="M8 2a.75.75 0 01.75.75v4.5h4.5a.75.75 0 010 1.5h-4.5v4.5a.75.75 0 01-1.5 0v-4.5h-4.5a.75.75 0 010-1.5h4.5v-4.5A.75.75 0 018 2z" />
+                        </svg>
+                    </button>
+                    <div class="navbar-dropdown account-more-dropdown">
+                        <button class="panel-action-btn account-more-btn dropdown-toggle" id="accountMoreBtn" title="更多操作" aria-haspopup="menu">
+                            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                                <circle cx="3" cy="8" r="1.6"></circle>
+                                <circle cx="8" cy="8" r="1.6"></circle>
+                                <circle cx="13" cy="8" r="1.6"></circle>
                             </svg>
                         </button>
-                        <button class="panel-action-btn" onclick="showTagManagementModal()" title="管理标签">
-                            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                                <path d="M7 1.5h6v6L6.5 14 2 9.5 7 1.5z"></path>
-                                <circle cx="9.5" cy="5" r="1.2" fill="currentColor"></circle>
-                            </svg>
-                        </button>
-                        <button class="panel-action-btn" id="accountMinimalBtn" onclick="toggleAccountMinimalMode()" title="切换极简展示" aria-pressed="false">
-                            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                                <rect x="2" y="2.5" width="12" height="2.5" rx="0.5"></rect>
-                                <rect x="2" y="6.75" width="12" height="2.5" rx="0.5"></rect>
-                                <rect x="2" y="11" width="12" height="2.5" rx="0.5"></rect>
-                            </svg>
-                        </button>
-                    </div>
-                    <span class="panel-action-separator"></span>
-                    <div class="panel-action-subgroup">
-                        <button class="panel-action-btn panel-action-btn-accent" onclick="showGetRefreshTokenModal()" title="授权并保存 Outlook 账号">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                                <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
-                                <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
-                            </svg>
-                        </button>
-                        <button class="panel-action-btn panel-action-btn-primary" onclick="showAddAccountModal()" title="导入邮箱账号">
-                            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                                <line x1="8" y1="2" x2="8" y2="14"></line>
-                                <line x1="2" y1="8" x2="14" y2="8"></line>
-                            </svg>
-                        </button>
+                        <div class="navbar-dropdown-menu" role="menu">
+                            <button class="dropdown-item account-menu-item account-menu-item--selection" role="menuitem"
+                                    onclick="toggleAccountSelectionMode(); closeAccountMoreMenu()" title="批量选择" aria-pressed="false">
+                                <span class="account-menu-item-icon">
+                                    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                                        <rect x="2" y="2" width="12" height="12" rx="2"></rect>
+                                        <path d="M5 8l2 2 4-4"></path>
+                                    </svg>
+                                </span>
+                                <span class="account-menu-item-label">批量选择</span>
+                                <span class="account-menu-item-check">
+                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                        <path d="M3 8.5l3.5 3.5L13 5"></path>
+                                    </svg>
+                                </span>
+                            </button>
+                            <button class="dropdown-item account-menu-item account-menu-item--tags" role="menuitem"
+                                    onclick="showTagManagementModal(); closeAccountMoreMenu()" title="管理标签">
+                                <span class="account-menu-item-icon">
+                                    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                                        <path d="M7 1.5h6v6L6.5 14 2 9.5 7 1.5z"></path>
+                                        <circle cx="9.5" cy="5" r="1.2" fill="currentColor"></circle>
+                                    </svg>
+                                </span>
+                                <span class="account-menu-item-label">管理标签</span>
+                            </button>
+                            <button class="dropdown-item account-menu-item account-menu-item--minimal" role="menuitem"
+                                    onclick="toggleAccountMinimalMode(); closeAccountMoreMenu()" title="切换极简展示" aria-pressed="false">
+                                <span class="account-menu-item-icon">
+                                    <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                                        <rect x="2" y="2.5" width="12" height="2.5" rx="0.5"></rect>
+                                        <rect x="2" y="6.75" width="12" height="2.5" rx="0.5"></rect>
+                                        <rect x="2" y="11" width="12" height="2.5" rx="0.5"></rect>
+                                    </svg>
+                                </span>
+                                <span class="account-menu-item-label">切换极简展示</span>
+                                <span class="account-menu-item-check">
+                                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                        <path d="M3 8.5l3.5 3.5L13 5"></path>
+                                    </svg>
+                                </span>
+                            </button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -316,6 +362,8 @@
                         <button class="batch-btn batch-btn-neutral" id="batchRemoveTagBtn" onclick="showBatchTagModal('remove')">标签-</button>
                         
                         <span class="batch-btn-divider"></span>
+                        <button class="batch-btn batch-btn-neutral" id="batchEnableAccountsBtn" onclick="updateStatusForSelectedAccounts('active')">启用账号</button>
+                        <button class="batch-btn batch-btn-neutral" id="batchDisableAccountsBtn" onclick="updateStatusForSelectedAccounts('inactive')">停用账号</button>
                         <button class="batch-btn batch-btn-danger" id="batchDeleteAccountsBtn" onclick="deleteSelectedAccounts()">删除</button>
                     </div>
                 </div>
@@ -353,11 +401,17 @@
                                 <span class="email-list-hint">按时间顺序查看邮件</span>
                             </div>
                         </div>
-                        <button class="refresh-btn" onclick="refreshEmails()" title="获取邮件">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                                <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path>
-                            </svg>
-                        </button>
+                        <div class="email-list-header-actions">
+                            <button class="compose-mail-btn" id="composeGraphMailBtn" type="button" hidden
+                                onclick="openGraphSendMailModal()" title="以当前 Outlook 账号写邮件">
+                                写邮件
+                            </button>
+                            <button class="refresh-btn" type="button" onclick="refreshEmails()" title="获取邮件">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path>
+                                </svg>
+                            </button>
+                        </div>
                     </div>
                     <div class="folder-tabs" id="folderTabs" style="display: none;">
                         <button class="folder-tab active" data-folder="all" onclick="switchFolder('all')">

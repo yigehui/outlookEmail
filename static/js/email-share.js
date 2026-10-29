@@ -7,6 +7,7 @@
     let isLoading = false;
     let currentMethod = 'graph';
     let selectedEmailId = null;
+    let isShareReady = false;
 
     // --- Utility Functions ---
     function createLucideIcons() {
@@ -39,6 +40,9 @@
     }
 
     function showInvalid(message) {
+        isShareReady = false;
+        const accessCodeState = document.getElementById('shareAccessCodeState');
+        if (accessCodeState) accessCodeState.hidden = true;
         const appBody = document.getElementById('appBody');
         if (appBody) appBody.style.display = 'none';
         
@@ -52,20 +56,48 @@
     }
 
     function showContent() {
+        isShareReady = true;
+        const accessCodeState = document.getElementById('shareAccessCodeState');
+        if (accessCodeState) accessCodeState.hidden = true;
         const invalid = document.getElementById('shareInvalidState');
         if (invalid) invalid.hidden = true;
-        
+
         const appBody = document.getElementById('appBody');
         if (appBody) appBody.style.display = 'flex';
-        
+
         setStatus('连接有效', 'active');
     }
 
-    async function requestJson(url) {
-        const response = await fetch(url, { cache: 'no-store' });
+    function showAccessCodePrompt() {
+        isShareReady = false;
+        const appBody = document.getElementById('appBody');
+        if (appBody) appBody.style.display = 'none';
+        const invalid = document.getElementById('shareInvalidState');
+        if (invalid) invalid.hidden = true;
+        const accessCodeState = document.getElementById('shareAccessCodeState');
+        if (accessCodeState) accessCodeState.hidden = false;
+        setStatus('等待访问码', 'invalid');
+        document.getElementById('shareAccessCodeInput')?.focus();
+        createLucideIcons();
+    }
+
+    function renderShareVisibilityHint(maxEmailCount) {
+        const hint = document.getElementById('shareVisibilityHint');
+        if (!hint) return;
+        const count = Number(maxEmailCount);
+        const isLimited = Number.isInteger(count) && count > 0;
+        hint.hidden = !isLimited;
+        hint.textContent = isLimited ? `仅显示收件箱和垃圾邮件中当前最新 ${count} 封邮件` : '';
+    }
+
+    async function requestJson(url, options = {}) {
+        const response = await fetch(url, { ...options, cache: 'no-store' });
         const data = await response.json();
         if (!response.ok || data.success === false) {
-            throw new Error(data.error || '请求失败');
+            if (data.status === 'access_code_required') showAccessCodePrompt();
+            const error = new Error(data.error || '请求失败');
+            error.status = data.status;
+            throw error;
         }
         return data;
     }
@@ -290,7 +322,7 @@
     }
 
     async function loadEmails({ append = false } = {}) {
-        if (isLoading) return;
+        if (!isShareReady || isLoading) return;
         isLoading = true;
 
         if (!append) {
@@ -682,6 +714,58 @@
         }
     }
 
+    async function loadShareContent() {
+        try {
+            const status = await requestJson(`/api/share/email/${encodeURIComponent(token)}/status`);
+            
+            const titleElement = document.getElementById('shareEmailTitle');
+            if (titleElement) titleElement.textContent = status.email || '邮箱分享';
+            renderShareVisibilityHint(status.max_email_count);
+
+            const headerAvatar = document.getElementById('headerUserAvatar');
+            if (headerAvatar) {
+                headerAvatar.textContent = getInitials(status.email);
+                headerAvatar.style.backgroundColor = getAvatarColor(status.email);
+            }
+            
+            showContent();
+            await loadEmails();
+        } catch (error) {
+            if (error.status !== 'access_code_required') showInvalid(error.message);
+        }
+    }
+
+    async function verifyAccessCode(event) {
+        event.preventDefault();
+        const input = document.getElementById('shareAccessCodeInput');
+        const button = document.getElementById('shareAccessCodeSubmit');
+        const errorText = document.getElementById('shareAccessCodeError');
+        if (!input || !button || button.disabled) return;
+        button.disabled = true;
+        if (errorText) errorText.hidden = true;
+        try {
+            await requestJson(`/api/share/email/${encodeURIComponent(token)}/verify`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': document.querySelector('meta[name="csrf-token"]')?.content || ''
+                },
+                body: JSON.stringify({ access_code: input.value })
+            });
+            input.value = '';
+            await loadShareContent();
+        } catch (error) {
+            if (['expired', 'revoked', 'invalid'].includes(error.status)) {
+                showInvalid(error.message);
+            } else if (errorText) {
+                errorText.textContent = error.message;
+                errorText.hidden = false;
+            }
+        } finally {
+            button.disabled = false;
+        }
+    }
+
     // --- Setup Initialization ---
     async function initializeSharePage() {
         insertGithubLink();
@@ -694,25 +778,12 @@
             showInvalid('分享链接不可用');
             return;
         }
-
-        try {
-            const status = await requestJson(`/api/share/email/${encodeURIComponent(token)}/status`);
-            
-            const titleElement = document.getElementById('shareEmailTitle');
-            if (titleElement) titleElement.textContent = status.email || '邮箱分享';
-            
-            const headerAvatar = document.getElementById('headerUserAvatar');
-            if (headerAvatar) {
-                headerAvatar.textContent = getInitials(status.email);
-                headerAvatar.style.backgroundColor = getAvatarColor(status.email);
-            }
-            
-            showContent();
-            await loadEmails();
-        } catch (error) {
-            showInvalid(error.message);
-        }
+        await loadShareContent();
     }
+
+    document.addEventListener('submit', (event) => {
+        if (event.target.id === 'shareAccessCodeForm') verifyAccessCode(event);
+    });
 
     // --- Global Event Delegation ---
     document.addEventListener('click', (event) => {

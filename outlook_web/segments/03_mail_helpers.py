@@ -1,4 +1,5 @@
 from __future__ import annotations
+from outlook_web.icloud_mail import message_recipient_headers
 
 import secrets
 
@@ -366,22 +367,27 @@ def build_graph_refresh_scope(graph_scopes: List[str]) -> str:
 
 
 def get_graph_token_scope_candidates(include_original_scope_fallback: bool = False) -> List[tuple[str, str]]:
+    if include_original_scope_fallback:
+        return [('default', GRAPH_DEFAULT_TOKEN_SCOPE), ('original', '')]
+
     configured_graph_scopes = [
         scope for scope in OAUTH_GRAPH_SCOPES
         if str(scope or '').startswith('https://graph.microsoft.com/')
     ]
-    read_graph_scopes = [
+    read_write_graph_scopes = [
         scope for scope in configured_graph_scopes
+        if scope != 'https://graph.microsoft.com/Mail.Send'
+    ]
+    read_graph_scopes = [
+        scope for scope in read_write_graph_scopes
         if scope != 'https://graph.microsoft.com/Mail.ReadWrite'
     ]
     raw_candidates = [
         ('configured', build_graph_refresh_scope(configured_graph_scopes)),
+        ('read_write', build_graph_refresh_scope(read_write_graph_scopes)),
         ('read', build_graph_refresh_scope(read_graph_scopes)),
         ('default', GRAPH_DEFAULT_TOKEN_SCOPE),
     ]
-    if include_original_scope_fallback:
-        raw_candidates.append(('original', ''))
-
     candidates = []
     seen_scopes = set()
     for label, scope in raw_candidates:
@@ -468,11 +474,22 @@ def _post_token_with_429_backoff(url: str, data: Dict[str, Any], *, proxy_url: s
     return response
 
 
+def extract_refresh_token_from_response(response) -> str:
+    """只提取响应中非空的 refresh_token，未返回时保留已有 token。"""
+    try:
+        payload = response.json()
+    except ValueError:
+        return ''
+    token = payload.get('refresh_token') if isinstance(payload, dict) else None
+    return token.strip() if isinstance(token, str) else ''
+
+
 def request_graph_token_response(client_id: str, refresh_token: str, proxy_url: str = None,
                                  fallback_proxy_urls: Optional[List[str]] = None,
                                  include_original_scope_fallback: bool = False):
-    """请求 Graph token，优先使用授权时的显式委托 scope，避免 .default 依赖应用预配置权限。"""
+    """拉信优先显式 scope；刷新优先 .default，缺少 refresh_token 时尝试原始 scope。"""
     last_response = None
+    successful_response = None
     candidates = get_graph_token_scope_candidates(include_original_scope_fallback)
     for index, (_label, scope) in enumerate(candidates):
         data = {
@@ -483,15 +500,28 @@ def request_graph_token_response(client_id: str, refresh_token: str, proxy_url: 
         if scope:
             data["scope"] = scope
 
-        response = _post_token_with_429_backoff(
-            TOKEN_URL_GRAPH,
-            data,
-            proxy_url=proxy_url,
-            fallback_proxy_urls=fallback_proxy_urls,
-        )
+        try:
+            response = _post_token_with_429_backoff(
+                TOKEN_URL_GRAPH,
+                data,
+                proxy_url=proxy_url,
+                fallback_proxy_urls=fallback_proxy_urls,
+            )
+        except requests.exceptions.RequestException:
+            if successful_response is not None:
+                return successful_response
+            raise
         last_response = response
         if response.status_code == 200:
-            return response
+            if not include_original_scope_fallback or extract_refresh_token_from_response(response):
+                return response
+            if successful_response is None:
+                successful_response = response
+            if index == len(candidates) - 1:
+                return successful_response
+            continue
+        if successful_response is not None:
+            return successful_response
         if index == len(candidates) - 1 or not is_graph_token_scope_retryable_response(response):
             return response
 
@@ -618,6 +648,225 @@ def get_access_token_graph(client_id: str, refresh_token: str, proxy_url: str = 
     return None
 
 
+_GRAPH_SEND_RECIPIENT_PATTERN = re.compile(r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
+_GRAPH_SEND_REAUTH_MARKERS = (
+    'invalid_grant',
+    'invalid_scope',
+    'consent_required',
+    'interaction_required',
+    'mail.send',
+    'insufficient privileges',
+    'access is denied',
+    'authorization has been denied',
+    'token has expired',
+    'token is expired',
+)
+
+
+def post_once_with_primary_proxy(url: str, *, proxy_url: str = None, **kwargs):
+    """通过主代理仅提交一次 POST，避免结果不确定时重复写入远端服务。"""
+    proxy_candidate = normalize_proxy_candidate(proxy_url)
+    if proxy_candidate:
+        log_outbound_proxy_usage(f'POST {url}', proxy_candidate, label='primary')
+        request_kwargs = build_request_kwargs_for_proxy(kwargs, proxy_candidate)
+    else:
+        log_outbound_proxy_usage(f'POST {url}', '')
+        request_kwargs = dict(kwargs)
+    request_kwargs['allow_redirects'] = False
+    return requests.request('post', url, **request_kwargs)
+
+
+def normalize_graph_send_mail_payload(recipients: Any, subject: Any, body: Any) -> tuple[Optional[Dict[str, Any]], str]:
+    """校验并规范化 Graph 基础发信字段。"""
+    if not isinstance(recipients, list):
+        return None, '收件人格式无效'
+
+    normalized_recipients = []
+    seen = set()
+    for raw_recipient in recipients:
+        if not isinstance(raw_recipient, str):
+            return None, '收件人格式无效'
+        address = raw_recipient.strip()
+        normalized_address = address.lower()
+        if not _GRAPH_SEND_RECIPIENT_PATTERN.fullmatch(address):
+            return None, '收件人邮箱地址无效'
+        if normalized_address not in seen:
+            seen.add(normalized_address)
+            normalized_recipients.append(normalized_address)
+
+    if not normalized_recipients:
+        return None, '请至少填写一个收件人'
+    if not isinstance(subject, str) or not isinstance(body, str):
+        return None, '主题和正文必须为文本'
+    if '\x00' in subject or '\x00' in body:
+        return None, '主题和正文不能包含空字符'
+    if '\r' in subject or '\n' in subject:
+        return None, '主题不能包含换行符'
+    if not subject.strip() and not body.strip():
+        return None, '主题和正文不能同时为空'
+
+    return {
+        'recipients': normalized_recipients,
+        'subject': subject,
+        'body': body,
+    }, ''
+
+
+def is_graph_send_reauthorization_error(status: Any, details: Any) -> bool:
+    """判断发信失败是否需要用户重新完成 Graph 授权。"""
+    try:
+        status_code = int(status or 0)
+    except (TypeError, ValueError):
+        status_code = 0
+    if status_code in {401, 403}:
+        return True
+    try:
+        details_text = json.dumps(details, ensure_ascii=True).lower()
+    except Exception:
+        details_text = str(details or '').lower()
+    return any(marker in details_text for marker in _GRAPH_SEND_REAUTH_MARKERS)
+
+
+def build_graph_send_error_result(code: str, message: str, status: int, details: Any = None,
+                                  *, retryable: bool = False, submission_unknown: bool = False,
+                                  retry_after: Optional[int] = None) -> Dict[str, Any]:
+    """构造基础发信的稳定失败结果，避免向客户端暴露敏感凭据。"""
+    result = {
+        'success': False,
+        'submitted': False,
+        'retryable': retryable,
+        'submission_unknown': submission_unknown,
+        'error': build_error_payload(code, message, 'GraphSendError', status, details),
+    }
+    if retry_after is not None:
+        result['retry_after'] = retry_after
+    return result
+
+
+def get_graph_send_retry_after(response) -> Optional[int]:
+    """读取 Graph 429 响应中的秒级 Retry-After；非秒值交给用户稍后重试。"""
+    try:
+        raw_value = str((response.headers or {}).get('Retry-After') or '').strip()
+        retry_after = int(raw_value)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return retry_after if retry_after >= 0 else None
+
+
+def send_graph_mail_result(client_id: str, refresh_token: str, recipients: Any, subject: Any, body: Any,
+                           proxy_url: str = None,
+                           fallback_proxy_urls: Optional[List[str]] = None) -> Dict[str, Any]:
+    """以当前 Graph 委托账号单次提交一封基础纯文本邮件。"""
+    payload, validation_error = normalize_graph_send_mail_payload(recipients, subject, body)
+    if validation_error:
+        return build_graph_send_error_result(
+            'GRAPH_SEND_INVALID_REQUEST',
+            validation_error,
+            400,
+        )
+
+    token_result = get_access_token_graph_result(
+        client_id,
+        refresh_token,
+        proxy_url,
+        fallback_proxy_urls,
+    )
+    if not token_result.get('success'):
+        token_error = token_result.get('error') or {}
+        token_status = token_error.get('status', 502) if isinstance(token_error, dict) else 502
+        token_details = token_error.get('details', '') if isinstance(token_error, dict) else token_error
+        if is_graph_send_reauthorization_error(token_status, token_details):
+            return build_graph_send_error_result(
+                'GRAPH_SEND_REAUTH_REQUIRED',
+                '发信权限不足或授权已失效，请重新完成 Graph 授权后再试',
+                403,
+                token_details,
+            )
+        return build_graph_send_error_result(
+            'GRAPH_SEND_TOKEN_FAILED',
+            '获取发信访问令牌失败，请稍后重试',
+            int(token_status or 502),
+            token_details,
+            retryable=bool(token_error.get('retryable')) if isinstance(token_error, dict) else False,
+        )
+
+    graph_payload = {
+        'message': {
+            'subject': payload['subject'],
+            'body': {
+                'contentType': 'Text',
+                'content': payload['body'],
+            },
+            'toRecipients': [
+                {'emailAddress': {'address': recipient}}
+                for recipient in payload['recipients']
+            ],
+        },
+    }
+    headers = {
+        'Authorization': f"Bearer {token_result.get('access_token')}",
+        'Content-Type': 'application/json',
+    }
+
+    try:
+        response = post_once_with_primary_proxy(
+            'https://graph.microsoft.com/v1.0/me/sendMail',
+            headers=headers,
+            json=graph_payload,
+            timeout=HTTP_REQUEST_TIMEOUT,
+            proxy_url=proxy_url,
+        )
+    except Exception as exc:
+        return build_graph_send_error_result(
+            'GRAPH_SEND_RESULT_UNKNOWN',
+            '邮件提交结果不确定，请确认后再决定是否重新发送',
+            503,
+            sanitize_error_details(str(exc)),
+            submission_unknown=True,
+        )
+
+    if response.status_code == 202:
+        return {
+            'success': True,
+            'submitted': True,
+            'message': '邮件已提交发送',
+        }
+
+    response_status = int(response.status_code or 502)
+    response_details = get_response_details(response)
+    if response_status == 429:
+        retry_after = get_graph_send_retry_after(response)
+        return build_graph_send_error_result(
+            'GRAPH_SEND_THROTTLED',
+            '发送请求过于频繁，请稍后重试',
+            429,
+            response_details,
+            retryable=True,
+            retry_after=retry_after,
+        )
+    if 300 <= response_status < 400 or response_status == 408 or response_status >= 500:
+        return build_graph_send_error_result(
+            'GRAPH_SEND_RESULT_UNKNOWN',
+            '邮件提交结果不确定，请确认后再决定是否重新发送',
+            response_status,
+            response_details,
+            submission_unknown=True,
+        )
+    if is_graph_send_reauthorization_error(response_status, response_details):
+        return build_graph_send_error_result(
+            'GRAPH_SEND_REAUTH_REQUIRED',
+            '发信权限不足或授权已失效，请重新完成 Graph 授权后再试',
+            403,
+            response_details,
+        )
+    return build_graph_send_error_result(
+        'GRAPH_SEND_FAILED',
+        '邮件提交失败，请检查收件人和账号状态后重试',
+        response_status,
+        response_details,
+    )
+
+
 def get_emails_graph(client_id: str, refresh_token: str, folder: str = 'inbox', skip: int = 0,
                      top: int = 20, proxy_url: str = None,
                      fallback_proxy_urls: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -643,7 +892,7 @@ def get_emails_graph(client_id: str, refresh_token: str, folder: str = 'inbox', 
         params = {
             "$top": top,
             "$skip": skip,
-            "$select": "id,subject,from,toRecipients,receivedDateTime,isRead,hasAttachments,bodyPreview",
+            "$select": "id,subject,from,toRecipients,ccRecipients,internetMessageHeaders,receivedDateTime,isRead,hasAttachments,bodyPreview",
             "$orderby": "receivedDateTime desc"
         }
         headers = {
@@ -725,7 +974,7 @@ def get_email_detail_graph_result(client_id: str, refresh_token: str, message_id
     try:
         url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}"
         params = {
-            "$select": "id,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,hasAttachments,body,bodyPreview"
+            "$select": "id,subject,from,toRecipients,ccRecipients,internetMessageHeaders,receivedDateTime,isRead,hasAttachments,body,bodyPreview"
         }
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -1131,6 +1380,7 @@ def get_emails_imap_with_server(account: str, client_id: str, refresh_token: str
                                 proxy_url: str = None,
                                 fallback_proxy_urls: Optional[List[str]] = None) -> Dict[str, Any]:
     """使用 IMAP 获取邮件列表（支持分页、文件夹选择和服务器选择）"""
+    require_stable_ids = email_share_stable_ids_context.get()
     token_result = get_access_token_imap_result(client_id, refresh_token, proxy_url, fallback_proxy_urls)
     if not token_result.get("success"):
         return {"success": False, "error": token_result.get("error")}
@@ -1157,39 +1407,73 @@ def get_emails_imap_with_server(account: str, client_id: str, refresh_token: str
                 )
             }
 
-        status, messages = connection.search(None, 'ALL')
-        if status != 'OK':
-            return {
-                "success": False,
-                "error": build_error_payload(
-                    "EMAIL_FETCH_FAILED",
-                    "获取邮件失败，请检查账号配置",
-                    "IMAPSearchError",
-                    500,
-                    f"search status={status}"
-                )
-            }
-        if not messages or not messages[0]:
+        if require_stable_ids:
+            message_ids, search_attempts = search_imap_message_uids_by_arrival(connection)
+            if message_ids is None:
+                return {
+                    "success": False,
+                    "error": build_error_payload(
+                        "EMAIL_FETCH_FAILED",
+                        "无法验证分享链接可访问邮件范围",
+                        "IMAPStableIdError",
+                        502,
+                        {'attempts': search_attempts[:10]}
+                    )
+                }
+            search_mode = 'uid'
+        else:
+            status, messages = connection.search(None, 'ALL')
+            if status != 'OK':
+                return {
+                    "success": False,
+                    "error": build_error_payload(
+                        "EMAIL_FETCH_FAILED",
+                        "获取邮件失败，请检查账号配置",
+                        "IMAPSearchError",
+                        500,
+                        f"search status={status}"
+                    )
+                }
+            message_ids = messages[0].split() if messages and messages[0] else []
+            search_mode = 'sequence'
+
+        if not message_ids:
             return {"success": True, "emails": []}
 
-        message_ids = messages[0].split()
         # 计算分页范围
         total = len(message_ids)
-        start_idx = max(0, total - skip - top)
-        end_idx = total - skip
+        if require_stable_ids:
+            start_idx = min(total, skip)
+            end_idx = min(total, skip + top)
+            paged_ids = message_ids[start_idx:end_idx]
+        else:
+            start_idx = max(0, total - skip - top)
+            end_idx = total - skip
+            paged_ids = message_ids[start_idx:end_idx][::-1]  # 倒序，最新的在前
 
         if start_idx >= end_idx:
             return {"success": True, "emails": []}
 
-        paged_ids = message_ids[start_idx:end_idx][::-1]  # 倒序，最新的在前
-
         emails = []
         for msg_id in paged_ids:
             try:
-                status, msg_data = connection.fetch(msg_id, '(INTERNALDATE RFC822)')
-                if status == 'OK' and msg_data and msg_data[0]:
-                    raw_email = msg_data[0][1]
-                    internal_date = extract_imap_internaldate(msg_data[0][0])
+                if require_stable_ids:
+                    status, msg_data, fetch_mode, _fetch_attempts = fetch_imap_message(
+                        connection,
+                        msg_id,
+                        '(INTERNALDATE RFC822)',
+                        preferred_mode='uid',
+                        allow_id_mode_fallback=False,
+                    )
+                    raw_email, fetch_response_text = parse_imap_fetch_response(msg_data)
+                    internal_date = extract_imap_internaldate(fetch_response_text)
+                    id_mode = fetch_mode or 'uid'
+                else:
+                    status, msg_data = connection.fetch(msg_id, '(INTERNALDATE RFC822)')
+                    raw_email = msg_data[0][1] if status == 'OK' and msg_data and msg_data[0] else None
+                    internal_date = extract_imap_internaldate(msg_data[0][0]) if raw_email else ''
+                    id_mode = 'sequence'
+                if status == 'OK' and raw_email:
                     msg = email.message_from_bytes(raw_email)
                     body_preview = get_email_body(msg)
 
@@ -1197,16 +1481,20 @@ def get_emails_imap_with_server(account: str, client_id: str, refresh_token: str
                         'id': msg_id.decode() if isinstance(msg_id, bytes) else str(msg_id),
                         'subject': decode_header_value(msg.get("Subject", "无主题")),
                         'from': decode_header_value(msg.get("From", "未知发件人")),
+                        'recipient_headers': message_recipient_headers(msg),
                         'to': decode_header_value(msg.get("To", "")),
                         'date': internal_date or msg.get("Date", "未知时间"),
-                        'id_mode': 'sequence',
+                        'id_mode': id_mode,
                         'body_preview': body_preview[:200] + "..." if len(body_preview) > 200 else body_preview
                     })
             except Exception:
                 continue
 
         emails.sort(key=lambda item: parse_email_datetime(item.get('date')) or datetime.min, reverse=True)
-        return {"success": True, "emails": emails}
+        response = {"success": True, "emails": emails}
+        if require_stable_ids:
+            response['has_more'] = end_idx < total
+        return response
     except Exception as exc:
         return {
             "success": False,
@@ -1313,7 +1601,8 @@ def annotate_email_detail_retry(error_payload: Any, attempts: int, retried: bool
 def _get_email_detail_imap_result_once(account: str, client_id: str, refresh_token: str, message_id: str,
                                        folder: str = 'inbox', proxy_url: str = None,
                                        fallback_proxy_urls: Optional[List[str]] = None,
-                                       preferred_id_mode: str = 'uid') -> Dict[str, Any]:
+                                       preferred_id_mode: str = 'uid',
+                                       strict_id_mode: bool = False) -> Dict[str, Any]:
     """单次 IMAP 详情获取（不含重试）。"""
     token_result = get_access_token_imap_result(client_id, refresh_token, proxy_url, fallback_proxy_urls)
     if not token_result.get('success'):
@@ -1361,7 +1650,8 @@ def _get_email_detail_imap_result_once(account: str, client_id: str, refresh_tok
             connection,
             message_id,
             '(RFC822)',
-            preferred_mode=preferred_mode
+            preferred_mode=preferred_mode,
+            allow_id_mode_fallback=not strict_id_mode,
         )
         if status != 'OK' or not msg_data:
             return {
@@ -1430,7 +1720,8 @@ def _get_email_detail_imap_result_once(account: str, client_id: str, refresh_tok
 def get_email_detail_imap_result(account: str, client_id: str, refresh_token: str, message_id: str,
                                  folder: str = 'inbox', proxy_url: str = None,
                                  fallback_proxy_urls: Optional[List[str]] = None,
-                                 preferred_id_mode: str = 'uid') -> Dict[str, Any]:
+                                 preferred_id_mode: str = 'uid',
+                                 strict_id_mode: bool = False) -> Dict[str, Any]:
     """使用 IMAP 获取邮件详情（包含结构化错误；传输类失败会有限重试一次）。"""
     max_attempts = max(1, int(EMAIL_DETAIL_IMAP_MAX_ATTEMPTS or 1))
     last_result: Dict[str, Any] = {'success': False, 'error': '获取邮件详情失败'}
@@ -1446,6 +1737,7 @@ def get_email_detail_imap_result(account: str, client_id: str, refresh_token: st
             proxy_url,
             fallback_proxy_urls,
             preferred_id_mode,
+            strict_id_mode,
         )
         if result.get('success'):
             if attempt > 1:
@@ -1649,6 +1941,7 @@ def build_email_detail_from_message(msg, message_id: str, date_value: str = '') 
         'id': str(message_id),
         'subject': decode_header_value(msg.get('Subject', '无主题')),
         'from': decode_header_value(msg.get('From', '未知发件人')),
+        'recipient_headers': message_recipient_headers(msg),
         'to': decode_header_value(msg.get('To', '')),
         'cc': decode_header_value(msg.get('Cc', '')),
         'date': date_value or msg.get('Date', ''),
@@ -1924,6 +2217,84 @@ def search_imap_message_ids(mail) -> tuple[Optional[List[bytes]], str, List[Dict
     return None, '', attempts
 
 
+def is_imap_search_protocol_rejection(attempts: List[Dict[str, Any]]) -> bool:
+    """判断 SEARCH 失败是否全部为服务器协议级拒绝（NO/BAD）。
+
+    协议级拒绝意味着服务器明确回了错误响应、连接本身仍然可用，
+    此时可以安全回退到按 SELECT EXISTS 的序列号枚举；
+    超时/连接中断等异常（status 为异常类名）则不行，回退 FETCH 也必挂。
+    """
+    if not attempts:
+        return False
+    return all(str(item.get('status') or '') in ('NO', 'BAD') for item in attempts)
+
+
+def is_imap_search_response_too_large(attempts: List[Dict[str, Any]]) -> bool:
+    """判断 SEARCH 失败是否因响应超过 imaplib 单行读取上限（imaplib._MAXLINE = 1MB）。
+
+    SEARCH ALL 把全部邮件 ID 放在一行返回，超大邮箱（约十几万封）会超限抛
+    imaplib.IMAP4.error("got more than 1000000 bytes")；且响应残留使连接失步，
+    后续命令会读到脏数据，只能重连后改按序列号枚举。
+    """
+    for item in attempts:
+        response = str(item.get('response') or '')
+        if 'got more than' in response and 'bytes' in response:
+            return True
+    return False
+
+
+def reopen_imap_session_for_sequence_fetch(email_addr: str, imap_password: str, imap_host: str,
+                                           imap_port: int, proxy_url: str, provider: str,
+                                           folder_name: str) -> tuple[Optional[Any], int]:
+    """连接因 SEARCH 响应超限失步后，重连并重新 SELECT 同一文件夹。
+
+    返回 (新连接, 新的 EXISTS 数)；任一步失败返回 (None, 0)，由调用方维持原报错。
+    """
+    mail = None
+    try:
+        mail = create_imap_connection(imap_host, imap_port, proxy_url)
+        mail.login(email_addr, imap_password)
+        send_imap_id(mail, provider, imap_host)
+        selected, attempts = try_select_imap_folder(mail, folder_name, readonly=True)
+        if not selected:
+            return None, 0
+        exists = 0
+        for attempt in reversed(attempts):
+            if str(attempt.get('status') or '') == 'OK':
+                exists = extract_imap_exists_count(attempt.get('response'))
+                if exists > 0:
+                    break
+        return mail, exists
+    except Exception:
+        if mail is not None:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+        return None, 0
+
+
+def search_imap_message_uids_by_arrival(mail) -> tuple[Optional[List[bytes]], List[Dict[str, Any]]]:
+    attempts: List[Dict[str, Any]] = []
+    try:
+        status, data = mail.uid('SORT', '(REVERSE ARRIVAL)', 'UTF-8', 'ALL')
+        attempts.append({
+            'mode': 'uid-arrival-sort',
+            'status': str(status),
+            'response': sanitize_error_details(str(data or ''))[:200],
+        })
+        if status == 'OK':
+            payload = data[0] if data else b''
+            return (payload.split() if payload else []), attempts
+    except Exception as exc:
+        attempts.append({
+            'mode': 'uid-arrival-sort',
+            'status': type(exc).__name__,
+            'response': sanitize_error_details(str(exc))[:200],
+        })
+    return None, attempts
+
+
 def build_sequence_message_ids(total_messages: int) -> List[bytes]:
     if total_messages <= 0:
         return []
@@ -1994,12 +2365,13 @@ def parse_imap_fetch_response(data: Any) -> tuple[bytes | None, str]:
     return raw_email, ' '.join(fragment for fragment in response_fragments if fragment).strip()
 
 
-def fetch_imap_message(mail, message_id: Any, query: str, preferred_mode: str = 'uid') -> tuple[str, Any, str, List[Dict[str, Any]]]:
+def fetch_imap_message(mail, message_id: Any, query: str, preferred_mode: str = 'uid',
+                       allow_id_mode_fallback: bool = True) -> tuple[str, Any, str, List[Dict[str, Any]]]:
     message_text = message_id.decode('utf-8', errors='ignore') if isinstance(message_id, (bytes, bytearray)) else str(message_id)
     modes = [preferred_mode]
-    if preferred_mode != 'uid':
+    if allow_id_mode_fallback and preferred_mode != 'uid':
         modes.append('uid')
-    if preferred_mode != 'sequence':
+    if allow_id_mode_fallback and preferred_mode != 'sequence':
         modes.append('sequence')
 
     attempts: List[Dict[str, Any]] = []
@@ -2421,7 +2793,8 @@ def delete_emails_imap_generic_result(email_addr: str, imap_password: str, imap_
 def get_emails_imap_generic(email_addr: str, imap_password: str, imap_host: str,
                             imap_port: int = 993, folder: str = 'inbox',
                             provider: str = 'custom', skip: int = 0, top: int = 20,
-                            proxy_url: str = '') -> Dict[str, Any]:
+                            proxy_url: str = '', recipient_address: str = '') -> Dict[str, Any]:
+    require_stable_ids = email_share_stable_ids_context.get()
     mail = None
     imap_id_info = {}
     try:
@@ -2478,39 +2851,95 @@ def get_emails_imap_generic(email_addr: str, imap_password: str, imap_host: str,
                 if selected_exists > 0:
                     break
 
-        message_ids, search_mode, search_attempts = search_imap_message_ids(mail)
-        if message_ids is None:
-            return {
-                'success': False,
-                'error': build_error_payload(
-                    'IMAP_SEARCH_FAILED',
-                    'IMAP 搜索邮件失败',
-                    'IMAPSearchError',
-                    502,
-                    {'attempts': search_attempts[:10]}
-                ),
-                'error_code': 'IMAP_SEARCH_FAILED'
-            }
+        if recipient_address:
+            safe_address = recipient_address.replace('\\', '\\\\').replace('"', '\\"')
+            criteria = '(OR OR OR HEADER To "{0}" HEADER Cc "{0}" HEADER Delivered-To "{0}" HEADER X-Original-To "{0}")'.format(safe_address)
+            status, data = mail.uid('SEARCH', None, criteria)
+            if status != 'OK':
+                return {'success': False, 'error': 'IMAP 收件人候选搜索失败', 'scan_incomplete': True}
+            message_ids = data[0].split() if data and data[0] else []
+            search_mode = 'uid'
+        elif require_stable_ids:
+            message_ids, search_attempts = search_imap_message_uids_by_arrival(mail)
+            if message_ids is None:
+                return {
+                    'success': False,
+                    'error': build_error_payload(
+                        'IMAP_STABLE_ID_UNAVAILABLE',
+                        '无法验证分享链接可访问邮件范围',
+                        'IMAPStableIdError',
+                        502,
+                        {'attempts': search_attempts[:10]}
+                    ),
+                    'error_code': 'IMAP_STABLE_ID_UNAVAILABLE'
+                }
+            search_mode = 'uid'
+        else:
+            message_ids, search_mode, search_attempts = search_imap_message_ids(mail)
+            if message_ids is None:
+                # 服务器明确拒绝 SEARCH（如阿里云 IMAP 返回 BAD）但连接仍可用时，
+                # 回退为按 SELECT EXISTS 的序列号枚举，避免整个邮箱无法浏览
+                sequence_ids = None
+                if selected_exists > 0 and is_imap_search_protocol_rejection(search_attempts):
+                    sequence_ids = build_sequence_message_ids(selected_exists)
+                    search_mode = 'sequence'
+                elif selected_exists > 0 and is_imap_search_response_too_large(search_attempts):
+                    # 超大邮箱 SEARCH ALL 单行响应超 imaplib 1MB 读取上限，连接已失步：
+                    # 重连后按序列号 1..EXISTS 枚举（SEARCH ALL 的结果本就是 1..N），
+                    # 只 FETCH 当前页，避开超限问题
+                    new_mail, new_exists = reopen_imap_session_for_sequence_fetch(
+                        email_addr, imap_password, imap_host, imap_port, proxy_url, provider, selected)
+                    if new_mail is not None:
+                        try:
+                            mail.logout()
+                        except Exception:
+                            pass
+                        mail = new_mail
+                        selected_exists = new_exists
+                        sequence_ids = build_sequence_message_ids(new_exists)
+                        search_mode = 'sequence'
+                if sequence_ids is None:
+                    return {
+                        'success': False,
+                        'error': build_error_payload(
+                            'IMAP_SEARCH_FAILED',
+                            'IMAP 搜索邮件失败',
+                            'IMAPSearchError',
+                            502,
+                            {'attempts': search_attempts[:10]}
+                        ),
+                        'error_code': 'IMAP_SEARCH_FAILED'
+                    }
+                message_ids = sequence_ids
 
-        if not message_ids and selected_exists > 0:
-            message_ids = build_sequence_message_ids(selected_exists)
-            search_mode = 'sequence'
+            if not message_ids and selected_exists > 0:
+                message_ids = build_sequence_message_ids(selected_exists)
+                search_mode = 'sequence'
 
         if not message_ids:
             return {'success': True, 'emails': [], 'method': 'IMAP (Generic)', 'has_more': False}
 
         total = len(message_ids)
-        start_idx = max(0, total - skip - top)
-        end_idx = total - skip
+        if require_stable_ids:
+            start_idx = min(total, skip)
+            end_idx = min(total, skip + top)
+            paged_uids = message_ids[start_idx:end_idx]
+        else:
+            start_idx = max(0, total - skip - top)
+            end_idx = total - skip
+            paged_uids = message_ids[start_idx:end_idx][::-1]
         if start_idx >= end_idx:
             return {'success': True, 'emails': [], 'method': 'IMAP (Generic)', 'has_more': False}
 
-        paged_uids = message_ids[start_idx:end_idx][::-1]
         emails_data = []
         for uid in paged_uids:
             try:
                 f_status, f_data, fetch_mode, _fetch_attempts = fetch_imap_message(
-                    mail, uid, '(FLAGS INTERNALDATE RFC822)', preferred_mode=search_mode or 'uid'
+                    mail,
+                    uid,
+                    '(FLAGS INTERNALDATE RFC822)',
+                    preferred_mode=search_mode or 'uid',
+                    allow_id_mode_fallback=not require_stable_ids,
                 )
                 if f_status != 'OK' or not f_data:
                     continue
@@ -2527,9 +2956,13 @@ def get_emails_imap_generic(email_addr: str, imap_password: str, imap_host: str,
                     'id': uid.decode('utf-8', errors='ignore') if isinstance(uid, (bytes, bytearray)) else str(uid),
                     'subject': decode_header_value(msg.get('Subject', '无主题')),
                     'from': decode_header_value(msg.get('From', '未知')),
+                    'recipient_headers': message_recipient_headers(msg),
                     'to': decode_header_value(msg.get('To', '')),
                     'date': internal_date or msg.get('Date', ''),
-                    'id_mode': search_mode or 'uid',
+                    'id_mode': (
+                        (fetch_mode or search_mode or 'uid')
+                        if require_stable_ids else (search_mode or 'uid')
+                    ),
                     'is_read': bool(re.search(r'\\Seen\b', fetch_response_text, flags=re.IGNORECASE)),
                     'has_attachments': has_message_attachments(msg),
                     'body_preview': preview,
@@ -2542,7 +2975,7 @@ def get_emails_imap_generic(email_addr: str, imap_password: str, imap_host: str,
             'success': True,
             'emails': emails_data,
             'method': 'IMAP (Generic)',
-            'has_more': start_idx > 0
+            'has_more': end_idx < total if require_stable_ids else start_idx > 0
         }
     except Exception as exc:
         return {
@@ -2569,7 +3002,7 @@ def get_emails_imap_generic(email_addr: str, imap_password: str, imap_host: str,
 def get_email_detail_imap_generic_result(email_addr: str, imap_password: str, imap_host: str,
                                          imap_port: int = 993, message_id: str = '',
                                          folder: str = 'inbox', provider: str = 'custom',
-                                         proxy_url: str = '') -> Dict[str, Any]:
+                                         proxy_url: str = '', strict_id_mode: bool = False) -> Dict[str, Any]:
     if not message_id:
         return {'success': False, 'error': build_error_payload('EMAIL_DETAIL_INVALID', 'message_id 不能为空', 'ValidationError', 400, '')}
 
@@ -2618,7 +3051,11 @@ def get_email_detail_imap_generic_result(email_addr: str, imap_password: str, im
             }
 
         status, msg_data, _fetch_mode, _fetch_attempts = fetch_imap_message(
-            mail, str(message_id), '(RFC822)', preferred_mode='uid'
+            mail,
+            str(message_id),
+            '(RFC822)',
+            preferred_mode='uid',
+            allow_id_mode_fallback=not strict_id_mode,
         )
         if status != 'OK' or not msg_data:
             return {
@@ -2962,6 +3399,24 @@ def api_key_required(f):
 
         return f(*args, **kwargs)
     decorated_function._requires_api_key = True
+    return decorated_function
+
+
+def api_key_write_required(f):
+    """API Key 写权限验证装饰器（只读权限时拒绝对外写操作）"""
+    def permission_gate(*args, **kwargs):
+        if get_external_api_key_permission() != 'readwrite':
+            return jsonify({
+                'success': False,
+                'error': '当前对外 API Key 权限为只读（readonly），无权执行该写操作；'
+                         '请在 Web 系统设置的「对外 API Key 权限」切换为读写（readwrite）后重试'
+            }), 403
+        return f(*args, **kwargs)
+
+    decorated_function = api_key_required(permission_gate)
+    decorated_function = wraps(f)(decorated_function)
+    decorated_function._requires_api_key = True
+    decorated_function._requires_api_key_write = True
     return decorated_function
 
 

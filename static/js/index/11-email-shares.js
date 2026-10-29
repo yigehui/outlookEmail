@@ -1,4 +1,4 @@
-        /* global copyTextToClipboard, escapeHtml, handleApiError, hideModal, showConfirmModal, showModal, showToast */
+        /* global copyTextToClipboard, escapeHtml, formatAbsoluteDateTime, handleApiError, hideModal, showConfirmModal, showModal, showToast */
 
         // ==================== 邮箱分享 ====================
 
@@ -13,7 +13,14 @@
             if (share.never_expires) {
                 return '永不过期';
             }
-            return share.expires_at || '未设置';
+            return formatAbsoluteDateTime(share.expires_at);
+        }
+
+        function formatEmailShareVisibility(share) {
+            const maxEmailCount = Number(share?.max_email_count);
+            return Number.isInteger(maxEmailCount) && maxEmailCount > 0
+                ? `最新 ${maxEmailCount} 封`
+                : '不限量';
         }
 
         function hideCreateEmailShareModal() {
@@ -30,14 +37,21 @@
                 result.hidden = true;
                 result.replaceChildren();
             }
+            const accessCode = document.getElementById('emailShareAccessCode');
+            if (accessCode) accessCode.value = '';
             const preset = document.getElementById('emailShareDurationPreset');
             if (preset) preset.value = '1440';
             const custom = document.getElementById('emailShareCustomDuration');
             if (custom) custom.value = '1440';
+            const visibilityMode = document.getElementById('emailShareVisibilityMode');
+            if (visibilityMode) visibilityMode.value = 'unlimited';
+            const maxEmailCount = document.getElementById('emailShareMaxEmailCount');
+            if (maxEmailCount) maxEmailCount.value = '1';
             const never = document.getElementById('emailShareNeverExpires');
             if (never) never.checked = false;
             syncEmailShareDurationPreset();
             toggleEmailShareNeverExpires();
+            toggleEmailShareVisibilityMode();
         }
 
         function showCreateEmailShareModal(accountId, email) {
@@ -61,6 +75,33 @@
             if (preset) preset.disabled = !!never;
             if (custom) custom.disabled = !!never;
             syncEmailShareDurationPreset();
+            updateEmailShareRollingWarning();
+        }
+
+        function isEmailShareVisibilityLimited() {
+            return document.getElementById('emailShareVisibilityMode')?.value === 'latest';
+        }
+
+        function toggleEmailShareVisibilityMode() {
+            const maxCountGroup = document.getElementById('emailShareMaxEmailCountGroup');
+            if (maxCountGroup) {
+                maxCountGroup.style.display = isEmailShareVisibilityLimited() ? 'block' : 'none';
+            }
+            updateEmailShareRollingWarning();
+        }
+
+        function updateEmailShareRollingWarning() {
+            const warning = document.getElementById('emailShareRollingWarning');
+            if (!warning) return;
+            const neverExpires = !!document.getElementById('emailShareNeverExpires')?.checked;
+            const isLimited = isEmailShareVisibilityLimited();
+            warning.hidden = !(neverExpires && isLimited);
+            if (neverExpires && isLimited) {
+                const maxEmailCount = getEmailShareMaxEmailCount();
+                warning.textContent = `永不过期的链接会持续显示未来最新的 ${maxEmailCount || 'N'} 封邮件。`;
+            } else {
+                warning.textContent = '';
+            }
         }
 
         function getEmailShareDurationMinutes() {
@@ -72,7 +113,14 @@
             return Number.isFinite(value) ? value : 0;
         }
 
-        function renderEmailShareCreateResult(share) {
+        function getEmailShareMaxEmailCount() {
+            if (!isEmailShareVisibilityLimited()) return null;
+            const rawValue = document.getElementById('emailShareMaxEmailCount')?.value;
+            const value = Number(rawValue);
+            return Number.isInteger(value) ? value : 0;
+        }
+
+        function renderEmailShareCreateResult(share, accessCode = '') {
             const result = document.getElementById('emailShareCreateResult');
             if (!result) return;
             result.hidden = false;
@@ -80,9 +128,11 @@
                 <div class="share-result__label">分享链接</div>
                 <div class="share-result__row">
                     <input type="text" class="form-input" readonly value="${escapeHtml(share.share_url || '')}">
-                    <button class="btn btn-secondary" type="button" onclick="copyEmailShareUrl('${escapeHtml(share.share_url || '')}')">复制</button>
+                    <button class="btn btn-secondary" type="button" onclick="copyEmailShareUrl('${escapeHtml(share.share_url || '')}', '${escapeHtml(accessCode)}')">${accessCode ? '复制链接和访问码' : '复制'}</button>
                 </div>
+                ${accessCode ? `<div class="form-hint">访问码：${escapeHtml(accessCode)}（请保存，关闭后无法再次查看）</div>` : ''}
                 <div class="form-hint">有效期：${escapeHtml(formatEmailShareExpiry(share))}</div>
+                <div class="form-hint">可见范围：${escapeHtml(formatEmailShareVisibility(share))}</div>
             `;
         }
 
@@ -90,12 +140,22 @@
             const accountId = parseInt(document.getElementById('emailShareAccountId')?.value || '0', 10);
             const neverExpires = !!document.getElementById('emailShareNeverExpires')?.checked;
             const durationMinutes = getEmailShareDurationMinutes();
+            const maxEmailCount = getEmailShareMaxEmailCount();
+            const accessCode = document.getElementById('emailShareAccessCode')?.value || '';
             if (!accountId) {
                 showToast('缺少邮箱账号', 'error');
                 return;
             }
             if (!neverExpires && durationMinutes <= 0) {
                 showToast('分享时长无效', 'error');
+                return;
+            }
+            if (isEmailShareVisibilityLimited() && (maxEmailCount < 1 || maxEmailCount > 50)) {
+                showToast('邮件数量限制应为 1 到 50 的整数', 'error');
+                return;
+            }
+            if (accessCode && !/^[A-Za-z0-9]{4,32}$/.test(accessCode)) {
+                showToast('访问码须为 4–32 位英文字母或数字', 'error');
                 return;
             }
 
@@ -108,12 +168,14 @@
                     body: JSON.stringify({
                         account_id: accountId,
                         duration_minutes: durationMinutes,
-                        never_expires: neverExpires
+                        never_expires: neverExpires,
+                        max_email_count: maxEmailCount,
+                        access_code: accessCode
                     })
                 });
                 const data = await response.json();
                 if (data.success) {
-                    renderEmailShareCreateResult(data.share);
+                    renderEmailShareCreateResult(data.share, accessCode);
                     showToast('分享链接已创建', 'success');
                     loadEmailShares();
                 } else {
@@ -125,12 +187,13 @@
                 if (button) button.disabled = false;
             }
         }
-        function copyEmailShareUrl(url) {
+        function copyEmailShareUrl(url, accessCode = '') {
             if (!url) {
                 showToast('分享链接不可用', 'error');
                 return;
             }
-            copyTextToClipboard(url, '分享链接已复制');
+            const text = accessCode ? `分享链接：${url}\n访问码：${accessCode}` : url;
+            copyTextToClipboard(text, accessCode ? '分享链接和访问码已复制' : '分享链接已复制');
         }
 
         let allEmailShares = [];
@@ -148,7 +211,7 @@
             if (!Array.isArray(shares) || shares.length === 0) {
                 tbody.innerHTML = `
                     <tr>
-                        <td colspan="7" class="share-empty">暂无分享记录</td>
+                        <td colspan="8" class="share-empty">暂无分享记录</td>
                     </tr>
                 `;
                 updateBatchActionButtons();
@@ -163,6 +226,7 @@
                 else if (share.status === 'revoked') badgeClass = 'share-badge--revoked';
 
                 const expiryStr = formatEmailShareExpiry(share);
+                const visibilityStr = formatEmailShareVisibility(share);
 
                 return `
                     <tr data-share-id="${share.id}">
@@ -176,12 +240,14 @@
                             <span class="share-badge ${badgeClass}">${escapeHtml(statusStr)}</span>
                         </td>
                         <td class="share-cell-mono">${escapeHtml(expiryStr)}</td>
-                        <td class="share-cell-mono">${escapeHtml(share.created_at || '')}</td>
+                        <td>${escapeHtml(visibilityStr)}</td>
+                        <td class="share-cell-mono" title="${escapeHtml(share.created_at || '')}">${escapeHtml(formatAbsoluteDateTime(share.created_at))}</td>
                         <td>
                             <div class="share-url-container">
                                 <input type="text" class="form-input share-url-input" readonly value="${escapeHtml(share.share_url || '')}">
                                 <button class="btn btn-secondary btn-sm-action" type="button" onclick="copyEmailShareUrl('${escapeHtml(share.share_url || '')}')">复制</button>
                             </div>
+                            <div class="form-hint">${share.requires_access_code ? '需访问码' : '无需访问码'}</div>
                         </td>
                         <td style="text-align: right;">
                             <div style="display: flex; gap: 6px; justify-content: flex-end;">
@@ -201,7 +267,7 @@
             if (tbody) {
                 tbody.innerHTML = `
                     <tr>
-                        <td colspan="7" class="share-empty">正在加载分享记录...</td>
+                        <td colspan="8" class="share-empty">正在加载分享记录...</td>
                     </tr>
                 `;
             }

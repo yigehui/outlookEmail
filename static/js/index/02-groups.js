@@ -1,4 +1,4 @@
-        /* global ACCOUNT_LIST_DEFAULT_PAGE_SIZE, ACCOUNT_LIST_MAX_PAGE_SIZE, accountListPageSize, accountListRequestSeq, accountPaginationState, accountSelectionMode, accountsCache, closeAllModals, currentAccount, currentAccountListSource, currentEmailDetail, currentEmailId, currentEmails, currentGroupId, currentSkip, currentSortBy, currentSortOrder, deleteAccount, editingGroupId, escapeHtml, formatAbsoluteDateTime, generateTempEmail, groups, handleAccountRowSelectionClick, handleAccountSelectionCheckboxClick, handleApiError, hasMoreEmails, hideModal, isMobileLayout, isTempEmailGroup, loadCloudflareChannelsForImport, loadTempEmails, localStorage, matchesSelectedTagFilters, normalizeTagFilterSelectionValue, openMobilePanel, renderEmptyStateMarkup, renderTempEmailList, resetSelectedAccountView, selectedColor, selectedTagFilters, setModalVisible, shouldShowAccountCreatedAt, shouldShowAccountSortOrder, showAddAccountModal, showGetRefreshTokenModal, showModal, showRefreshError, showTagManagementModal, showToast, suppressGroupClickUntil, tempEmailGroupId, toggleAccountSelectionMode, updateCurrentGroupHeader, updateMobileContext */
+        /* global ACCOUNT_LIST_DEFAULT_PAGE_SIZE, ACCOUNT_LIST_MAX_PAGE_SIZE, accountListPageSize, accountListRequestSeq, accountPaginationState, accountSelectionMode, accountsCache, closeAllModals, currentAccount, currentAccountListSource, currentAccountSummary, currentEmailDetail, currentEmailId, currentEmails, currentGroupId, currentSkip, currentSortBy, currentSortOrder, deleteAccount, editingGroupId, escapeHtml, excludedTagFilters, formatAbsoluteDateTime, generateTempEmail, groups, handleAccountRowSelectionClick, handleAccountSelectionCheckboxClick, handleApiError, hasActiveTagFilters, hasMoreEmails, hideModal, isMobileLayout, isTempEmailGroup, loadCloudflareChannelsForImport, loadTempEmails, localStorage, matchesSelectedTagFilters, normalizeTagFilterSelectionValue, openMobilePanel, renderEmptyStateMarkup, renderTempEmailList, resetSelectedAccountView, selectedColor, selectedTagFilters, setModalVisible, shouldShowAccountCreatedAt, shouldShowAccountSortOrder, showAddAccountModal, showGetRefreshTokenModal, showModal, showRefreshError, showTagManagementModal, showToast, suppressGroupClickUntil, syncAccountMoreActiveDot, syncAccountTagFilterOptions, tempEmailGroupId, toggleAccountSelectionMode, updateCurrentGroupHeader, updateGraphSendMailAvailability, updateMobileContext, updateTagFilterSummary */
 
         // ==================== 分组相关 ====================
 
@@ -6,8 +6,31 @@
         const ACCOUNT_SEARCH_QUERY_STORAGE_KEY = 'outlook_account_search_query';
         const ACCOUNT_SORT_STORAGE_KEY = 'outlook_account_sort';
         const ACCOUNT_TAG_FILTER_STORAGE_KEY = 'outlook_account_tag_filters';
+        const ACCOUNT_TAG_EXCLUDE_FILTER_STORAGE_KEY = 'outlook_account_tag_exclude_filters';
         const GROUP_COLLAPSED_STORAGE_PREFIX = 'outlook_group_collapsed_';
+        const GROUP_DESCRIPTION_VISIBILITY_STORAGE_KEY = 'outlook_group_descriptions_visible';
         let groupTree = [];
+
+        function shouldShowGroupDescriptions() {
+            return localStorage.getItem(GROUP_DESCRIPTION_VISIBILITY_STORAGE_KEY) === 'true';
+        }
+
+        function syncGroupDescriptionVisibilityButton() {
+            const button = document.getElementById('groupDescriptionVisibilityBtn');
+            if (!button) return;
+
+            const visible = shouldShowGroupDescriptions();
+            button.classList.toggle('active', visible);
+            button.setAttribute('aria-pressed', visible ? 'true' : 'false');
+            button.title = visible ? '隐藏分组描述' : '显示分组描述';
+        }
+
+        function toggleGroupDescriptionVisibility() {
+            const visible = !shouldShowGroupDescriptions();
+            localStorage.setItem(GROUP_DESCRIPTION_VISIBILITY_STORAGE_KEY, String(visible));
+            syncGroupDescriptionVisibilityButton();
+            renderGroupList(groups);
+        }
 
         function normalizeGroupLevel(group) {
             const level = Number(group?.level || 1);
@@ -226,6 +249,7 @@
         // 加载分组列表
         async function loadGroups() {
             const container = document.getElementById('groupList');
+            syncGroupDescriptionVisibilityButton();
             container.innerHTML = '<div class="loading loading-small"><div class="loading-spinner"></div></div>';
 
             try {
@@ -311,10 +335,11 @@
                 return;
             }
 
-            container.innerHTML = renderGroupTree(groupTree);
+            const showGroupDescriptions = shouldShowGroupDescriptions();
+            container.innerHTML = renderGroupTree(groupTree, showGroupDescriptions);
         }
 
-        function renderGroupTree(nodes) {
+        function renderGroupTree(nodes, showGroupDescriptions = shouldShowGroupDescriptions()) {
             return nodes.map(group => {
                 const isSystem = isSystemGroup(group);
                 const isTempGroup = group.name === '临时邮箱';
@@ -327,6 +352,7 @@
                 const groupName = normalizeGroupName(group.name);
                 const groupIdBadgeText = formatGroupIdBadgeText(group.id);
                 const count = group.descendant_account_count ?? group.account_count ?? 0;
+                const groupDescription = String(group.description || '').trim();
 
                 return `
                     <div class="group-item level-${level} ${currentGroupId === group.id ? 'active' : ''} ${isTempGroup ? 'temp-email-group' : ''} ${isMovable ? 'draggable' : ''} ${isDragging ? 'dragging' : ''}"
@@ -345,8 +371,13 @@
                                 ${!isDefault && !isSystem ? `<button class="group-action-btn" onclick="event.stopPropagation(); deleteGroup(${group.id})" title="删除">🗑️</button>` : ''}
                             </div>
                         </div>
+                        ${showGroupDescriptions && groupDescription ? `
+                        <div class="group-row-2">
+                            <span class="group-description" title="${escapeHtml(groupDescription)}">${escapeHtml(groupDescription)}</span>
+                        </div>
+                        ` : ''}
                     </div>
-                    ${hasChildren && !collapsed ? renderGroupTree(group.children) : ''}
+                    ${hasChildren && !collapsed ? renderGroupTree(group.children, showGroupDescriptions) : ''}
                 `;
             }).join('');
         }
@@ -819,7 +850,7 @@
         // 刷新按钮（复用 refreshCurrentAccountList 功能）
         function renderAccountRefreshButton() {
             return `
-                <button class="panel-action-btn" onclick="refreshCurrentAccountList()" title="刷新邮箱列表">
+                <button class="panel-action-btn" id="refreshAccountListBtn" onclick="refreshCurrentAccountList()" title="刷新邮箱列表">
                     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M1 8a7 7 0 0 1 13.22-3.22M15 8a7 7 0 0 1-13.22 3.22"/>
                         <path d="M14 1v3.5H10.5M2 15v-3.5h3.5"/>
@@ -828,33 +859,85 @@
             `;
         }
 
-        // 更新账号面板头部动作按钮
-        function renderAccountSelectionModeButton() {
-            const activeClass = accountSelectionMode ? ' active' : '';
-            const title = accountSelectionMode ? '退出批量选择' : '批量选择';
+        function closeAccountMoreMenu() {
+            document.querySelectorAll('.account-more-dropdown').forEach(dropdown => {
+                dropdown.classList.remove('is-open');
+            });
+        }
+
+        function renderAccountSelectionMenuItem() {
+            const active = accountSelectionMode === true;
+            const label = active ? '退出批量选择' : '批量选择';
             return `
-                <button class="panel-action-btn account-selection-mode-btn${activeClass}" id="accountSelectionModeBtn"
-                        onclick="toggleAccountSelectionMode()" title="${title}" aria-pressed="${accountSelectionMode ? 'true' : 'false'}">
-                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                        <rect x="2" y="2" width="12" height="12" rx="2"></rect>
-                        <path d="M5 8l2 2 4-4"></path>
-                    </svg>
+                <button class="dropdown-item account-menu-item account-menu-item--selection${active ? ' active' : ''}" role="menuitem"
+                        onclick="toggleAccountSelectionMode(); closeAccountMoreMenu()"
+                        title="${label}" aria-pressed="${active ? 'true' : 'false'}">
+                    <span class="account-menu-item-icon">
+                        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="2" y="2" width="12" height="12" rx="2"></rect>
+                            <path d="M5 8l2 2 4-4"></path>
+                        </svg>
+                    </span>
+                    <span class="account-menu-item-label">${label}</span>
+                    <span class="account-menu-item-check">
+                        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M3 8.5l3.5 3.5L13 5"></path>
+                        </svg>
+                    </span>
                 </button>
             `;
         }
 
-        function renderAccountMinimalModeButton() {
+        function renderAccountMinimalMenuItem() {
             const isMinimal = localStorage.getItem('outlook_account_list_minimal') === 'true';
-            const activeClass = isMinimal ? ' active' : '';
-            const title = isMinimal ? '切换详细展示' : '切换极简展示';
+            const label = isMinimal ? '切换详细展示' : '切换极简展示';
             return `
-                <button class="panel-action-btn${activeClass}" id="accountMinimalBtn" onclick="toggleAccountMinimalMode()" title="${title}" aria-pressed="${isMinimal ? 'true' : 'false'}">
-                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                        <rect x="2" y="2.5" width="12" height="2.5" rx="0.5"></rect>
-                        <rect x="2" y="6.75" width="12" height="2.5" rx="0.5"></rect>
-                        <rect x="2" y="11" width="12" height="2.5" rx="0.5"></rect>
-                    </svg>
+                <button class="dropdown-item account-menu-item account-menu-item--minimal${isMinimal ? ' active' : ''}" role="menuitem"
+                        onclick="toggleAccountMinimalMode(); closeAccountMoreMenu()"
+                        title="${label}" aria-pressed="${isMinimal ? 'true' : 'false'}">
+                    <span class="account-menu-item-icon">
+                        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="2" y="2.5" width="12" height="2.5" rx="0.5"></rect>
+                            <rect x="2" y="6.75" width="12" height="2.5" rx="0.5"></rect>
+                            <rect x="2" y="11" width="12" height="2.5" rx="0.5"></rect>
+                        </svg>
+                    </span>
+                    <span class="account-menu-item-label">${label}</span>
+                    <span class="account-menu-item-check">
+                        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M3 8.5l3.5 3.5L13 5"></path>
+                        </svg>
+                    </span>
                 </button>
+            `;
+        }
+
+        // 更多操作下拉（批量选择/管理标签/切换极简展示）
+        function renderAccountMoreDropdown() {
+            return `
+                <div class="navbar-dropdown account-more-dropdown">
+                    <button class="panel-action-btn account-more-btn dropdown-toggle" id="accountMoreBtn" title="更多操作" aria-haspopup="menu">
+                        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                            <circle cx="3" cy="8" r="1.6"></circle>
+                            <circle cx="8" cy="8" r="1.6"></circle>
+                            <circle cx="13" cy="8" r="1.6"></circle>
+                        </svg>
+                    </button>
+                    <div class="navbar-dropdown-menu" role="menu">
+                        ${renderAccountSelectionMenuItem()}
+                        <button class="dropdown-item account-menu-item account-menu-item--tags" role="menuitem"
+                                onclick="showTagManagementModal(); closeAccountMoreMenu()" title="管理标签">
+                            <span class="account-menu-item-icon">
+                                <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M7 1.5h6v6L6.5 14 2 9.5 7 1.5z"></path>
+                                    <circle cx="9.5" cy="5" r="1.2" fill="currentColor"></circle>
+                                </svg>
+                            </span>
+                            <span class="account-menu-item-label">管理标签</span>
+                        </button>
+                        ${renderAccountMinimalMenuItem()}
+                    </div>
+                </div>
             `;
         }
 
@@ -865,14 +948,6 @@
             if (isTempEmailGroup) {
                 actions.innerHTML = `
                     ${renderAccountRefreshButton()}
-                    ${renderAccountSelectionModeButton()}
-                    <button class="panel-action-btn" onclick="showTagManagementModal()" title="管理标签">
-                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                            <path d="M7 1.5h6v6L6.5 14 2 9.5 7 1.5z"></path>
-                            <circle cx="9.5" cy="5" r="1.2" fill="currentColor"></circle>
-                        </svg>
-                    </button>
-                    ${renderAccountMinimalModeButton()}
                     <button class="panel-action-btn panel-action-btn-accent" onclick="generateTempEmail()" title="生成临时邮箱">
                         <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                             <polygon points="9 1 2 9 8 9 7 15 14 7 8 7 9 1"></polygon>
@@ -884,6 +959,7 @@
                                 d="M8 2a.75.75 0 01.75.75v4.5h4.5a.75.75 0 010 1.5h-4.5v4.5a.75.75 0 01-1.5 0v-4.5h-4.5a.75.75 0 010-1.5h4.5v-4.5A.75.75 0 018 2z" />
                         </svg>
                     </button>
+                    ${renderAccountMoreDropdown()}
                 `;
                 // 显示渠道筛选、隐藏排序
                 document.getElementById('tempEmailProviderFilter').style.display = 'flex';
@@ -902,14 +978,6 @@
             } else {
                 actions.innerHTML = `
                     ${renderAccountRefreshButton()}
-                    ${renderAccountSelectionModeButton()}
-                    <button class="panel-action-btn" onclick="showTagManagementModal()" title="管理标签">
-                        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                            <path d="M7 1.5h6v6L6.5 14 2 9.5 7 1.5z"></path>
-                            <circle cx="9.5" cy="5" r="1.2" fill="currentColor"></circle>
-                        </svg>
-                    </button>
-                    ${renderAccountMinimalModeButton()}
                     <button class="panel-action-btn panel-action-btn-accent" onclick="showGetRefreshTokenModal()" title="授权并保存 Outlook 账号">
                         <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                             <circle cx="5.5" cy="10.5" r="3.5"></circle>
@@ -922,6 +990,7 @@
                                 d="M8 2a.75.75 0 01.75.75v4.5h4.5a.75.75 0 010 1.5h-4.5v4.5a.75.75 0 01-1.5 0v-4.5h-4.5a.75.75 0 010-1.5h4.5v-4.5A.75.75 0 018 2z" />
                         </svg>
                     </button>
+                    ${renderAccountMoreDropdown()}
                 `;
                 // 隐藏渠道筛选、显示排序、恢复标签筛选
                 document.getElementById('tempEmailProviderFilter').style.display = 'none';
@@ -934,6 +1003,9 @@
                 if (searchInput) {
                     searchInput.placeholder = '邮箱|别名|备注|标签';
                 }
+            }
+            if (typeof syncAccountMoreActiveDot === 'function') {
+                syncAccountMoreActiveDot();
             }
         }
 
@@ -959,45 +1031,70 @@
         }
 
         function getAccountTagFilterParams() {
-            const values = Array.from(selectedTagFilters || []);
-            const tagIds = values
-                .filter(value => !isUntaggedTagFilterValue(value))
+            const tagIds = Array.from(selectedTagFilters || [])
                 .map(value => normalizeTagFilterSelectionValue(value))
-                .filter(value => Number.isFinite(value) && value > 0);
-            const includeUntagged = values.some(value => isUntaggedTagFilterValue(value));
-            return { tagIds, includeUntagged };
+                .filter(value => value !== null);
+            const excludeTagIds = Array.from(excludedTagFilters || [])
+                .map(value => normalizeTagFilterSelectionValue(value))
+                .filter(value => value !== null);
+            return { tagIds, excludeTagIds };
         }
 
         function hasAccountServerSideFilters() {
             const filters = getAccountTagFilterParams();
-            return filters.tagIds.length > 0 || filters.includeUntagged;
+            return filters.tagIds.length > 0 || filters.excludeTagIds.length > 0;
         }
 
-        function loadAccountTagFilterPreference() {
+        function loadStoredAccountTagFilterValues(storageKey) {
             try {
-                const storedValue = localStorage.getItem(ACCOUNT_TAG_FILTER_STORAGE_KEY);
+                const storedValue = localStorage.getItem(storageKey);
                 const values = storedValue ? JSON.parse(storedValue) : [];
                 if (!Array.isArray(values)) {
                     return new Set();
                 }
-                return new Set(
+                const normalizedValues = Array.from(new Set(
                     values
                         .map(value => normalizeTagFilterSelectionValue(value))
                         .filter(value => value !== null)
-                );
+                ));
+                if (JSON.stringify(values) !== JSON.stringify(normalizedValues)) {
+                    try {
+                        localStorage.setItem(storageKey, JSON.stringify(normalizedValues));
+                    } catch (error) {
+                        // 内存中的规范化状态仍可用于当前会话。
+                    }
+                }
+                return new Set(normalizedValues);
             } catch (error) {
                 return new Set();
             }
         }
 
-        function saveAccountTagFilterPreference() {
-            const values = Array.from(selectedTagFilters || [])
+        function saveAccountTagFilterPreferenceValues(storageKey, values) {
+            const normalizedValues = Array.from(values || [])
                 .map(value => normalizeTagFilterSelectionValue(value))
                 .filter(value => value !== null);
-            localStorage.setItem(ACCOUNT_TAG_FILTER_STORAGE_KEY, JSON.stringify(Array.from(new Set(values))));
+            localStorage.setItem(storageKey, JSON.stringify(Array.from(new Set(normalizedValues))));
+        }
+
+        function loadAccountTagFilterPreference() {
+            return loadStoredAccountTagFilterValues(ACCOUNT_TAG_FILTER_STORAGE_KEY);
+        }
+
+        function saveAccountTagFilterPreference() {
+            saveAccountTagFilterPreferenceValues(ACCOUNT_TAG_FILTER_STORAGE_KEY, selectedTagFilters);
+        }
+
+        function loadAccountTagExcludeFilterPreference() {
+            return loadStoredAccountTagFilterValues(ACCOUNT_TAG_EXCLUDE_FILTER_STORAGE_KEY);
+        }
+
+        function saveAccountTagExcludeFilterPreference() {
+            saveAccountTagFilterPreferenceValues(ACCOUNT_TAG_EXCLUDE_FILTER_STORAGE_KEY, excludedTagFilters);
         }
 
         selectedTagFilters = loadAccountTagFilterPreference();
+        excludedTagFilters = loadAccountTagExcludeFilterPreference();
 
         function normalizeAccountPageSize(value) {
             const parsed = parseInt(value, 10);
@@ -1135,9 +1232,9 @@
             if (filters.tagIds.length) {
                 params.set('tag_ids', filters.tagIds.join(','));
             }
-            if (filters.includeUntagged) {
-                params.set('include_untagged', '1');
-            }
+            filters.excludeTagIds.forEach(tagId => {
+                params.append('exclude_tag_ids', String(tagId));
+            });
             return params;
         }
 
@@ -1398,7 +1495,7 @@
             );
         }
 
-        function handleAccountItemClick(event, email, isTemp = false) {
+        function handleAccountItemClick(event, email, isTemp = false, accountId = 0) {
             if (isAccountRowInteractiveTarget(event?.target)) {
                 return;
             }
@@ -1409,7 +1506,7 @@
             if (isTemp) {
                 selectTempEmail(email);
             } else {
-                selectAccount(email);
+                selectAccount(email, accountId);
             }
         }
 
@@ -1442,7 +1539,7 @@
             container.innerHTML = accounts.map(acc => `
                 <div class="account-item ${currentAccount === acc.email ? 'active' : ''} ${acc.status === 'inactive' ? 'inactive' : ''}"
                      data-account-id="${acc.id}"
-                     onclick="handleAccountItemClick(event, '${escapeJs(acc.email)}')">
+                     onclick="handleAccountItemClick(event, '${escapeJs(acc.email)}', false, ${Number(acc.id) || 0})">
                     <input type="checkbox" class="account-select-checkbox" value="${acc.id}" 
                            data-account-email="${escapeHtml(acc.email)}"
                            data-account-type="${escapeHtml(acc.account_type || 'outlook')}"
@@ -1702,6 +1799,10 @@
 
         function resetSelectedAccountView() {
             currentAccount = null;
+            currentAccountSummary = null;
+            if (typeof updateGraphSendMailAvailability === 'function') {
+                updateGraphSendMailAvailability();
+            }
             currentEmailId = null;
             currentEmailDetail = null;
             currentEmails = [];
@@ -1777,7 +1878,7 @@
             }
 
             // 1. Tag 筛选
-            if (selectedTagFilters.size > 0) {
+            if (hasActiveTagFilters()) {
                 result = result.filter(acc => matchesSelectedTagFilters(acc.tags));
             }
 
@@ -1820,29 +1921,22 @@
             });
         }
 
-        // Tag Filter Change Handler
-        function handleTagFilterChange() {
-            const dropdown = document.getElementById('tagFilterDropdown');
-            const selected = dropdown ? dropdown.querySelectorAll('.tag-filter-checkbox:checked') : document.querySelectorAll('.tag-filter-checkbox:checked');
-            selectedTagFilters = new Set(
-                Array.from(selected)
-                    .map(cb => normalizeTagFilterSelectionValue(cb.value))
-                    .filter(value => value !== null)
-            );
+        function applyAccountTagFilterChange() {
             saveAccountTagFilterPreference();
-            const optionScope = dropdown || document;
-            optionScope.querySelectorAll('.tag-filter-option').forEach(option => {
-                const checkbox = option.querySelector('.tag-filter-checkbox');
-                option.classList.toggle('is-checked', !!checkbox?.checked);
-            });
-            updateTagFilterSummary();
+            saveAccountTagExcludeFilterPreference();
+            if (typeof syncAccountTagFilterOptions === 'function') {
+                syncAccountTagFilterOptions();
+            } else {
+                updateTagFilterSummary();
+            }
             invalidateAccountCaches();
             if (isTempEmailGroup) {
                 if (currentAccountListSource.length) {
                     renderTempEmailList(currentAccountListSource);
                 }
                 return;
-            } else if (currentGroupId) {
+            }
+            if (currentGroupId) {
                 refreshVisibleAccountList(true);
                 return;
             }
@@ -1850,6 +1944,36 @@
             if (currentAccountListSource.length) {
                 renderFilteredAccountList(currentAccountListSource);
             }
+        }
+
+        function handleTagFilterChange() {
+            applyAccountTagFilterChange();
+        }
+
+        function setAccountTagFilterSelection(value, state, event) {
+            event?.stopPropagation();
+            const tagId = normalizeTagFilterSelectionValue(value);
+            if (tagId === null) {
+                return;
+            }
+
+            if (state === 'include') {
+                if (selectedTagFilters.has(tagId)) {
+                    selectedTagFilters.delete(tagId);
+                } else {
+                    selectedTagFilters.add(tagId);
+                    excludedTagFilters.delete(tagId);
+                }
+            } else if (state === 'exclude') {
+                if (excludedTagFilters.has(tagId)) {
+                    excludedTagFilters.delete(tagId);
+                } else {
+                    excludedTagFilters.add(tagId);
+                    selectedTagFilters.delete(tagId);
+                }
+            }
+
+            applyAccountTagFilterChange();
         }
 
         // 防抖函数
@@ -2028,6 +2152,7 @@
 
         // 显示添加分组模态框
         const MAIL_PROVIDER_LABELS = {
+            icloud: 'iCloud',
             outlook: 'Outlook',
             gmail: 'Gmail',
             qq: 'QQ',
@@ -2057,7 +2182,8 @@
                 telegram: 'telegram',
                 wecom: 'wecom',
                 wechatwork: 'wecom',
-                qywx: 'wecom'
+                qywx: 'wecom',
+                feishu: 'feishu'
             };
             const values = Array.isArray(rawChannels)
                 ? rawChannels
@@ -2070,25 +2196,25 @@
             )];
         }
 
+        const FORWARD_CHANNEL_CHECKBOX_IDS = {
+            smtp: 'forwardChannelSmtp',
+            telegram: 'forwardChannelTelegram',
+            wecom: 'forwardChannelWecom',
+            feishu: 'forwardChannelFeishu',
+        };
+
         function getSelectedForwardChannels() {
-            const checkboxMap = {
-                smtp: 'forwardChannelSmtp',
-                telegram: 'forwardChannelTelegram',
-                wecom: 'forwardChannelWecom',
-            };
-            return Object.keys(checkboxMap).filter(channel =>
-                document.getElementById(checkboxMap[channel])?.checked
+            return Object.keys(FORWARD_CHANNEL_CHECKBOX_IDS).filter(channel =>
+                document.getElementById(FORWARD_CHANNEL_CHECKBOX_IDS[channel])?.checked
             );
         }
 
         function setSelectedForwardChannels(rawChannels) {
             const channels = normalizeForwardChannels(rawChannels);
-            const smtpCheckbox = document.getElementById('forwardChannelSmtp');
-            const telegramCheckbox = document.getElementById('forwardChannelTelegram');
-            const wecomCheckbox = document.getElementById('forwardChannelWecom');
-            if (smtpCheckbox) smtpCheckbox.checked = channels.includes('smtp');
-            if (telegramCheckbox) telegramCheckbox.checked = channels.includes('telegram');
-            if (wecomCheckbox) wecomCheckbox.checked = channels.includes('wecom');
+            Object.entries(FORWARD_CHANNEL_CHECKBOX_IDS).forEach(([channel, id]) => {
+                const checkbox = document.getElementById(id);
+                if (checkbox) checkbox.checked = channels.includes(channel);
+            });
             syncForwardChannelUI();
         }
 

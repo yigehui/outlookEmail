@@ -120,6 +120,7 @@
                                 <label class="form-label">邮箱类型</label>
                                 <select class="form-select" id="importProviderSelect" onchange="updateImportHint()">
                                     <option value="outlook">Outlook OAuth</option>
+                                    <option value="icloud">iCloud（App 专用密码）</option>
                                     <option value="gmail">Gmail</option>
                                     <option value="qq">QQ</option>
                                     <option value="163">163</option>
@@ -224,6 +225,7 @@
                                 <label class="form-label">邮箱类型</label>
                                 <select class="form-select" id="editProviderSelect" onchange="updateEditAccountFields()">
                                     <option value="outlook">Outlook OAuth</option>
+                                    <option value="icloud">iCloud（App 专用密码）</option>
                                     <option value="gmail">Gmail</option>
                                     <option value="qq">QQ</option>
                                     <option value="163">163</option>
@@ -411,6 +413,7 @@
                             <div class="form-group">
                                 <label class="form-label">别名邮箱</label>
                                 <textarea class="form-textarea edit-account-note" id="editAliases" placeholder="每行一个别名邮箱，例如&#10;alias1@example.com&#10;alias2@example.com" rows="4"></textarea>
+                                <p id="editManagedAliases" class="form-hint"></p>
                                 <div class="form-hint">支持多个别名。保存后，可直接用别名邮箱调用 API 获取该账号收到的邮件或验证码。</div>
                             </div>
                         </div>
@@ -475,6 +478,48 @@
         </div>
     </div>
 
+    <!-- Outlook Graph 基础写信模态框 -->
+    <div class="modal" id="graphSendMailModal" aria-hidden="true"
+        onmousedown="if(event.target === this) hideGraphSendMailModal()">
+        <div class="modal-content graph-send-mail-modal-content">
+            <div class="modal-header">
+                <h3>写邮件</h3>
+                <button class="modal-close" type="button" aria-label="关闭写邮件" onclick="hideGraphSendMailModal()">&times;</button>
+            </div>
+            <form id="graphSendMailForm" onsubmit="event.preventDefault(); sendGraphMail();">
+                <div class="modal-body">
+                    <input type="hidden" id="graphSendMailAccountId">
+                    <div class="form-group">
+                        <label class="form-label" for="graphSendMailAccountEmail">发件账号</label>
+                        <input type="text" class="form-input" id="graphSendMailAccountEmail" readonly>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="graphSendMailRecipients">收件人</label>
+                        <input type="text" class="form-input" id="graphSendMailRecipients" autocomplete="email"
+                            placeholder="多个地址用逗号、分号或换行分隔" oninput="validateGraphSendMailRecipients()">
+                        <div class="form-hint">仅支持基础纯文本邮件。</div>
+                        <div class="graph-send-mail-validation" id="graphSendMailRecipientsError" role="alert" hidden></div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="graphSendMailSubject">主题</label>
+                        <input type="text" class="form-input" id="graphSendMailSubject" autocomplete="off" maxlength="998">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="graphSendMailBody">正文</label>
+                        <textarea class="form-textarea graph-send-mail-body" id="graphSendMailBody" spellcheck="true"></textarea>
+                    </div>
+                    <div class="graph-send-mail-status" id="graphSendMailStatus" role="status" hidden></div>
+                    <button class="btn btn-secondary graph-send-mail-reauthorize" id="graphSendMailReauthorizeBtn"
+                        type="button" hidden onclick="reauthorizeGraphSendMailAccount()">重新 Graph 授权</button>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" type="button" onclick="hideGraphSendMailModal()">取消</button>
+                    <button class="btn btn-primary" id="graphSendMailSubmitBtn" type="submit">提交发送</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <!-- 邮箱分享创建模态框 -->
     <div class="modal" id="createEmailShareModal" onmousedown="if(event.target === this) hideCreateEmailShareModal()">
         <div class="modal-content" style="width: 520px;">
@@ -487,6 +532,11 @@
                 <div class="form-group">
                     <label class="form-label">邮箱</label>
                     <input type="text" class="form-input" id="emailShareAccountEmail" readonly>
+                </div>
+                <div class="form-group">
+                    <label class="form-label" for="emailShareAccessCode">访问码（可选）</label>
+                    <input type="text" class="form-input" id="emailShareAccessCode" minlength="4" maxlength="32" pattern="[A-Za-z0-9]{4,32}" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="留空则无需访问码">
+                    <div class="form-hint">4–32 位英文字母或数字，区分大小写。设置后，访客需输入访问码才能查看邮箱。</div>
                 </div>
                 <div class="form-group">
                     <label class="form-label">有效期</label>
@@ -503,11 +553,24 @@
                     <input type="number" class="form-input" id="emailShareCustomDuration" min="1" step="1" value="1440">
                 </div>
                 <div class="form-group">
+                    <label class="form-label" for="emailShareVisibilityMode">可查看邮件</label>
+                    <select class="form-select" id="emailShareVisibilityMode" onchange="toggleEmailShareVisibilityMode()">
+                        <option value="unlimited" selected>不限量</option>
+                        <option value="latest">仅最新 N 封</option>
+                    </select>
+                </div>
+                <div class="form-group" id="emailShareMaxEmailCountGroup" style="display: none;">
+                    <label class="form-label" for="emailShareMaxEmailCount">最新邮件数量</label>
+                    <input type="number" class="form-input" id="emailShareMaxEmailCount" min="1" max="50" step="1" value="1" oninput="updateEmailShareRollingWarning()">
+                    <div class="form-hint">收件箱和垃圾邮件合计仅显示当前最新的 N 封。</div>
+                </div>
+                <div class="form-group">
                     <label class="settings-toggle settings-toggle--inline">
                         <input type="checkbox" id="emailShareNeverExpires" onchange="toggleEmailShareNeverExpires()">
                         <span class="form-label">永不过期</span>
                     </label>
                 </div>
+                <div class="form-hint" id="emailShareRollingWarning" hidden></div>
                 <div class="share-result" id="emailShareCreateResult" hidden></div>
             </div>
             <div class="modal-footer">
@@ -700,6 +763,7 @@
                                 <th width="160" class="sortable-header" data-sort-col="expires_at" onclick="handleHeaderSort('expires_at')">
                                     有效期至<span class="sort-indicator"> ↕</span>
                                 </th>
+                                <th width="110">可见范围</th>
                                 <th width="160" class="sortable-header" data-sort-col="created_at" onclick="handleHeaderSort('created_at')">
                                     创建时间<span class="sort-indicator"> ↕</span>
                                 </th>
@@ -709,7 +773,7 @@
                         </thead>
                         <tbody id="emailShareTableBody">
                             <tr>
-                                <td colspan="7" class="share-empty">正在加载分享记录...</td>
+                                <td colspan="8" class="share-empty">正在加载分享记录...</td>
                             </tr>
                         </tbody>
                     </table>

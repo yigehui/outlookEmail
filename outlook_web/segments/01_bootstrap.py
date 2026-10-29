@@ -29,6 +29,7 @@ import subprocess
 import tempfile
 import zipfile
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.header import decode_header
@@ -134,6 +135,7 @@ token_refresh_run_lock = threading.Lock()
 webdav_backup_run_lock = threading.Lock()
 forwarding_run_lock = threading.Lock()
 proxy_socket_lock = threading.RLock()
+email_share_stable_ids_context = ContextVar('email_share_stable_ids_context', default=False)
 
 
 # 初始化 CSRF 保护（如果可用）
@@ -579,6 +581,9 @@ IMAP_IDENTITY_FIELDS = {
 }
 
 MAIL_PROVIDERS = {
+    "icloud": {
+        "label": "iCloud", "imap_host": "imap.mail.me.com", "imap_port": 993, "account_type": "imap",
+    },
     "outlook": {
         "label": "Outlook",
         "imap_host": IMAP_SERVER_NEW,
@@ -636,6 +641,7 @@ MAIL_PROVIDERS = {
 }
 
 DOMAIN_PROVIDER_MAP = {
+    "icloud.com": "icloud", "me.com": "icloud", "mac.com": "icloud",
     "outlook.com": "outlook",
     "hotmail.com": "outlook",
     "live.com": "outlook",
@@ -701,9 +707,11 @@ IMAP_FOLDER_MATCH_ALIASES = {
 FORWARD_CHANNEL_EMAIL = "email"
 FORWARD_CHANNEL_TELEGRAM = "telegram"
 FORWARD_CHANNEL_WECOM = "wecom"
+FORWARD_CHANNEL_FEISHU = "feishu"
 FORWARD_CHANNEL_SMTP_SETTING = "smtp"
 FORWARD_CHANNEL_TG_SETTING = "telegram"
 FORWARD_CHANNEL_WECOM_SETTING = "wecom"
+FORWARD_CHANNEL_FEISHU_SETTING = "feishu"
 SMTP_FORWARD_PROVIDERS = ('outlook', 'qq', '163', '126', 'yahoo', 'aliyun', 'custom')
 
 # 数据库文件
@@ -733,6 +741,7 @@ INDEX_CSS_FILES = (
     'css/index/06-modals-toast.css',
     'css/index/07-meta.css',
     'css/index/08-responsive.css',
+    'css/index/09-icloud.css',
 )
 INDEX_JS_FILES = (
     'js/index/01-core.js',
@@ -747,6 +756,8 @@ INDEX_JS_FILES = (
     'js/index/10-batch-actions.js',
     'js/index/11-email-shares.js',
     'js/index/12-outlook-upload-accounts.js',
+    'js/index/13-projects.js',
+    'js/index/14-icloud.js',
 )
 
 # GPTMail API 配置
@@ -777,10 +788,11 @@ export_verify_tokens = {}
 # OAuth 配置
 OAUTH_CLIENT_ID = os.getenv("OAUTH_CLIENT_ID", "9e5f94bc-e8a4-4e73-b8be-63364c29d753")
 OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI", "http://localhost:8080")
-# Graph 委托权限（读信 / 标已读等写操作 / 基本用户信息）
+# Graph 委托权限（读信 / 邮件管理和发信 / 基本用户信息）
 OAUTH_GRAPH_SCOPES = [
     "https://graph.microsoft.com/Mail.Read",
     "https://graph.microsoft.com/Mail.ReadWrite",
+    "https://graph.microsoft.com/Mail.Send",
     "https://graph.microsoft.com/User.Read",
 ]
 # 手动 OAuth 助手默认走 GraphAPI（单资源，避免与 IMAP 混用触发 AADSTS70011）
@@ -788,6 +800,7 @@ OAUTH_SCOPES = [
     "offline_access",
     "https://graph.microsoft.com/Mail.Read",
     "https://graph.microsoft.com/Mail.ReadWrite",
+    "https://graph.microsoft.com/Mail.Send",
     "https://graph.microsoft.com/User.Read",
 ]
 
@@ -1368,8 +1381,10 @@ def init_db():
             fallback_proxy_url_1 TEXT DEFAULT '',
             fallback_proxy_url_2 TEXT DEFAULT '',
             last_refresh_at TIMESTAMP,
+            last_refresh_success_at TIMESTAMP,
             last_refresh_status TEXT DEFAULT 'never',
             last_refresh_error TEXT,
+            last_refresh_token_rotated INTEGER,
             refresh_token_updated_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1504,10 +1519,16 @@ def init_db():
             refresh_type TEXT DEFAULT 'manual',
             status TEXT NOT NULL,
             error_message TEXT,
+            token_rotated INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (account_id) REFERENCES accounts (id) ON DELETE CASCADE
         )
     ''')
+
+    cursor.execute('PRAGMA table_info(account_refresh_logs)')
+    refresh_log_columns = [column[1] for column in cursor.fetchall()]
+    if 'token_rotated' not in refresh_log_columns:
+        cursor.execute('ALTER TABLE account_refresh_logs ADD COLUMN token_rotated INTEGER')
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS token_refresh_state (
@@ -1587,8 +1608,12 @@ def init_db():
             account_id INTEGER NOT NULL,
             token_hash TEXT UNIQUE NOT NULL,
             token_encrypted TEXT NOT NULL,
+            access_code_hash TEXT,
             expires_at TIMESTAMP,
             never_expires INTEGER NOT NULL DEFAULT 0,
+            max_email_count INTEGER CHECK (
+                max_email_count IS NULL OR (max_email_count BETWEEN 1 AND 50)
+            ),
             revoked_at TIMESTAMP,
             last_accessed_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1604,6 +1629,12 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_email_share_links_status
         ON email_share_links(revoked_at, expires_at, never_expires)
     ''')
+    cursor.execute("PRAGMA table_info(email_share_links)")
+    email_share_columns = [col[1] for col in cursor.fetchall()]
+    if 'max_email_count' not in email_share_columns:
+        cursor.execute('ALTER TABLE email_share_links ADD COLUMN max_email_count INTEGER')
+    if 'access_code_hash' not in email_share_columns:
+        cursor.execute('ALTER TABLE email_share_links ADD COLUMN access_code_hash TEXT')
 
     # 创建审计日志表
     cursor.execute('''
@@ -1818,6 +1849,24 @@ def init_db():
         cursor.execute("ALTER TABLE accounts ADD COLUMN last_refresh_status TEXT DEFAULT 'never'")
     if 'last_refresh_error' not in columns:
         cursor.execute('ALTER TABLE accounts ADD COLUMN last_refresh_error TEXT')
+    if 'last_refresh_token_rotated' not in columns:
+        cursor.execute('ALTER TABLE accounts ADD COLUMN last_refresh_token_rotated INTEGER')
+    if 'last_refresh_success_at' not in columns:
+        cursor.execute('ALTER TABLE accounts ADD COLUMN last_refresh_success_at TIMESTAMP')
+        cursor.execute('''
+            UPDATE accounts
+            SET last_refresh_success_at = (
+                SELECT MAX(l.created_at)
+                FROM account_refresh_logs l
+                WHERE l.account_id = accounts.id AND l.status = 'success'
+            )
+        ''')
+        cursor.execute('''
+            UPDATE accounts
+            SET last_refresh_success_at = last_refresh_at
+            WHERE last_refresh_status = 'success' AND last_refresh_at IS NOT NULL
+              AND (last_refresh_success_at IS NULL OR last_refresh_at > last_refresh_success_at)
+        ''')
     if 'refresh_token_updated_at' not in columns:
         cursor.execute('ALTER TABLE accounts ADD COLUMN refresh_token_updated_at TIMESTAMP')
     if 'account_type' not in columns:
@@ -2271,6 +2320,14 @@ def init_db():
     ''')
     cursor.execute('''
         INSERT OR IGNORE INTO settings (key, value)
+        VALUES ('feishu_webhook_url', '')
+    ''')
+    cursor.execute('''
+        INSERT OR IGNORE INTO settings (key, value)
+        VALUES ('feishu_sign_secret', '')
+    ''')
+    cursor.execute('''
+        INSERT OR IGNORE INTO settings (key, value)
         VALUES ('webdav_backup_enabled', 'false')
     ''')
     cursor.execute('''
@@ -2496,6 +2553,9 @@ def init_db():
 
     # 迁移现有明文数据为加密数据
     migrate_sensitive_data(conn)
+
+    from outlook_web.icloud_store import init_icloud_schema
+    init_icloud_schema(conn)
 
     conn.commit()
     conn.close()
@@ -3501,6 +3561,15 @@ def get_gptmail_api_key() -> str:
 def get_external_api_key() -> str:
     """获取对外 API Key（从数据库读取，明文存储）"""
     return get_setting('external_api_key', '')
+
+
+EXTERNAL_API_KEY_PERMISSIONS = ('readonly', 'readwrite')
+
+
+def get_external_api_key_permission() -> str:
+    """获取对外 API Key 权限级别（非法值与未配置均按只读兜底）"""
+    permission = str(get_setting('external_api_key_permission', 'readonly') or '').strip().lower()
+    return permission if permission in EXTERNAL_API_KEY_PERMISSIONS else 'readonly'
 
 
 def get_duckmail_base_url() -> str:

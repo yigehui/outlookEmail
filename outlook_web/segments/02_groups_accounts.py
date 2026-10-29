@@ -505,14 +505,17 @@ def normalize_tag_filter_values(tag_ids: Any = None) -> List[int]:
     return normalized
 
 
-def build_account_tag_filter_clause(tag_ids: Any = None, include_untagged: bool = False) -> tuple[str, List[Any]]:
+def build_account_tag_filter_clause(tag_ids: Any = None, include_untagged: bool = False,
+                                    exclude_tag_ids: Any = None) -> tuple[str, List[Any]]:
     normalized_tag_ids = normalize_tag_filter_values(tag_ids)
+    normalized_exclude_tag_ids = normalize_tag_filter_values(exclude_tag_ids)
+    include_clauses = []
     clauses = []
     params: List[Any] = []
 
     if normalized_tag_ids:
         placeholders = ','.join('?' * len(normalized_tag_ids))
-        clauses.append(f'''
+        include_clauses.append(f'''
             EXISTS (
                 SELECT 1
                 FROM account_tags at_filter
@@ -523,7 +526,7 @@ def build_account_tag_filter_clause(tag_ids: Any = None, include_untagged: bool 
         params.extend(normalized_tag_ids)
 
     if include_untagged:
-        clauses.append('''
+        include_clauses.append('''
             NOT EXISTS (
                 SELECT 1
                 FROM account_tags at_filter
@@ -531,10 +534,25 @@ def build_account_tag_filter_clause(tag_ids: Any = None, include_untagged: bool 
             )
         ''')
 
+    if include_clauses:
+        clauses.append('(' + ' OR '.join(include_clauses) + ')')
+
+    if normalized_exclude_tag_ids:
+        placeholders = ','.join('?' * len(normalized_exclude_tag_ids))
+        clauses.append(f'''
+            NOT EXISTS (
+                SELECT 1
+                FROM account_tags at_exclude
+                WHERE at_exclude.account_id = a.id
+                  AND at_exclude.tag_id IN ({placeholders})
+            )
+        ''')
+        params.extend(normalized_exclude_tag_ids)
+
     if not clauses:
         return '', []
 
-    return '(' + ' OR '.join(clauses) + ')', params
+    return '(' + ' AND '.join(clauses) + ')', params
 
 
 ACCOUNT_SEARCH_MAX_TERMS = 200
@@ -559,7 +577,8 @@ def normalize_account_search_terms(query: Any) -> List[str]:
 
 def build_account_where_clause(group_id: int = None, query: str = '',
                                tag_ids: Any = None, include_untagged: bool = False,
-                               include_descendants: bool = True) -> tuple[str, List[Any]]:
+                               include_descendants: bool = True,
+                               exclude_tag_ids: Any = None) -> tuple[str, List[Any]]:
     clauses = []
     params: List[Any] = []
 
@@ -586,7 +605,11 @@ def build_account_where_clause(group_id: int = None, query: str = '',
         if search_term_clauses:
             clauses.append('(' + ' OR '.join(search_term_clauses) + ')')
 
-    tag_clause, tag_params = build_account_tag_filter_clause(tag_ids, include_untagged)
+    tag_clause, tag_params = build_account_tag_filter_clause(
+        tag_ids,
+        include_untagged,
+        exclude_tag_ids,
+    )
     if tag_clause:
         clauses.append(tag_clause)
         params.extend(tag_params)
@@ -663,7 +686,8 @@ def serialize_account_rows(rows: List[sqlite3.Row], db=None) -> List[Dict]:
 def load_accounts(group_id: int = None, limit: Any = None, offset: Any = 0,
                   sort_by: Any = 'created_at', sort_order: Any = 'desc',
                   tag_ids: Any = None, include_untagged: bool = False,
-                  include_descendants: bool = True) -> List[Dict]:
+                  include_descendants: bool = True,
+                  exclude_tag_ids: Any = None) -> List[Dict]:
     """从数据库加载邮箱账号"""
     db = get_db()
     normalized_limit, normalized_offset = normalize_account_pagination(limit, offset)
@@ -672,6 +696,7 @@ def load_accounts(group_id: int = None, limit: Any = None, offset: Any = 0,
         tag_ids=tag_ids,
         include_untagged=include_untagged,
         include_descendants=include_descendants,
+        exclude_tag_ids=exclude_tag_ids,
     )
     order_clause = build_account_order_clause(sort_by, sort_order)
     pagination_clause = ''
@@ -693,7 +718,8 @@ def load_accounts(group_id: int = None, limit: Any = None, offset: Any = 0,
 
 def count_accounts(group_id: int = None, query: str = '',
                    tag_ids: Any = None, include_untagged: bool = False,
-                   include_descendants: bool = True) -> int:
+                   include_descendants: bool = True,
+                   exclude_tag_ids: Any = None) -> int:
     db = get_db()
     normalized_query = str(query or '').strip()
     joins = '''
@@ -706,11 +732,12 @@ def count_accounts(group_id: int = None, query: str = '',
             LEFT JOIN tags t ON at.tag_id = t.id
         '''
     where_clause, params = build_account_where_clause(
-        group_id,
-        normalized_query,
-        tag_ids,
-        include_untagged,
-        include_descendants,
+        group_id=group_id,
+        query=normalized_query,
+        tag_ids=tag_ids,
+        include_untagged=include_untagged,
+        include_descendants=include_descendants,
+        exclude_tag_ids=exclude_tag_ids,
     )
     count_expr = 'COUNT(DISTINCT a.id)' if normalized_query else 'COUNT(*)'
     row = db.execute(f'''
@@ -725,7 +752,8 @@ def count_accounts(group_id: int = None, query: str = '',
 def search_account_records(query: str, limit: Any = None, offset: Any = 0,
                            sort_by: Any = 'created_at', sort_order: Any = 'desc',
                            tag_ids: Any = None, include_untagged: bool = False,
-                           group_id: int = None, include_descendants: bool = True) -> List[Dict]:
+                           group_id: int = None, include_descendants: bool = True,
+                           exclude_tag_ids: Any = None) -> List[Dict]:
     db = get_db()
     normalized_limit, normalized_offset = normalize_account_pagination(limit, offset)
     where_clause, params = build_account_where_clause(
@@ -734,6 +762,7 @@ def search_account_records(query: str, limit: Any = None, offset: Any = 0,
         tag_ids=tag_ids,
         include_untagged=include_untagged,
         include_descendants=include_descendants,
+        exclude_tag_ids=exclude_tag_ids,
     )
     order_clause = build_account_order_clause(sort_by, sort_order)
     pagination_clause = ''
@@ -942,6 +971,10 @@ def validate_account_aliases(account_id: int, primary_email: str, aliases: List[
         if normalized == primary_normalized:
             errors.append(f'别名 {normalized} 不能与主邮箱相同')
             continue
+        if (get_db().execute('SELECT 1 FROM icloud_hme_aliases WHERE address=?', (normalized,)).fetchone()
+                and not get_db().execute('SELECT 1 FROM account_aliases WHERE account_id=? AND LOWER(alias_email)=? AND icloud_alias_id IS NULL', (account_id, normalized)).fetchone()):
+            errors.append(f'别名 {normalized} 由 iCloud 管理，请前往 iCloud 管理修改')
+            continue
         if email_exists_as_primary(normalized, exclude_account_id=account_id):
             errors.append(f'别名 {normalized} 已被其他主邮箱占用')
             continue
@@ -959,12 +992,15 @@ def validate_account_aliases(account_id: int, primary_email: str, aliases: List[
 
 def replace_account_aliases(account_id: int, primary_email: str, aliases: List[str], db=None) -> tuple[bool, List[str], List[str]]:
     database = db or get_db()
+    managed = {row[0].lower() for row in database.execute(
+        'SELECT alias_email FROM account_aliases WHERE account_id=? AND icloud_alias_id IS NOT NULL', (account_id,))}
+    aliases = [alias for alias in aliases if normalize_email_address(alias) not in managed]
     cleaned_aliases, errors = validate_account_aliases(account_id, primary_email, aliases)
     if errors:
         return False, cleaned_aliases, errors
 
     try:
-        database.execute('DELETE FROM account_aliases WHERE account_id = ?', (account_id,))
+        database.execute('DELETE FROM account_aliases WHERE account_id = ? AND icloud_alias_id IS NULL', (account_id,))
         for alias_email in cleaned_aliases:
             database.execute(
                 '''
@@ -1070,19 +1106,20 @@ def resolve_account_by_address(email_addr: str) -> Optional[Dict]:
     if row:
         return resolve_account_record(row)
 
-    alias_row = db.execute(
-        '''
-        SELECT a.*, aa.alias_email AS matched_alias
-        FROM account_aliases aa
-        JOIN accounts a ON a.id = aa.account_id
-        WHERE LOWER(aa.alias_email) = ?
-        LIMIT 1
-        ''',
-        (normalized,)
-    ).fetchone()
-    if not alias_row:
-        return None
-    return resolve_account_record(alias_row, matched_alias=alias_row['matched_alias'])
+    manual_alias = db.execute('''SELECT a.*, aa.alias_email AS matched_alias FROM account_aliases aa
+        JOIN accounts a ON a.id=aa.account_id WHERE LOWER(aa.alias_email)=? AND aa.icloud_alias_id IS NULL LIMIT 1''', (normalized,)).fetchone()
+    if manual_alias:
+        return resolve_account_record(manual_alias, matched_alias=manual_alias['matched_alias'])
+
+    from outlook_web.icloud_store import ICloudStore
+    context = ICloudStore(db, get_cipher()).resolve(normalized)
+    if context:
+        row = db.execute('SELECT * FROM accounts WHERE id=?', (context['mailbox_account_id'],)).fetchone()
+        account = resolve_account_record(row, matched_alias=normalized)
+        account.update(context)
+        return account
+
+    return None
 
 
 def build_plus_fallback_emails(email_addr: str) -> List[str]:
@@ -1391,8 +1428,14 @@ def serialize_account_summary(account: Dict[str, Any], last_refresh_log: Optiona
         'forward_enabled': bool(account.get('forward_enabled')),
         'proxy_override_enabled': account_has_proxy_override(account),
         'last_refresh_at': refresh_state['last_refresh_at'],
+        'last_refresh_success_at': account.get('last_refresh_success_at'),
+        'refresh_token_updated_at': account.get('refresh_token_updated_at'),
         'last_refresh_status': refresh_state['last_refresh_status'],
         'last_refresh_error': refresh_state['last_refresh_error'],
+        'last_refresh_token_rotated': (
+            bool(account['last_refresh_token_rotated'])
+            if account.get('last_refresh_token_rotated') is not None else None
+        ),
         'created_at': account.get('created_at', ''),
         'updated_at': account.get('updated_at', ''),
         'tags': account.get('tags', [])
@@ -2154,6 +2197,7 @@ def update_account(account_id: int, email_addr: str, password: str, client_id: s
 
 PROJECT_ACCOUNT_STATUSES = {'toClaim', 'claiming', 'done', 'failed', 'removed', 'deleted'}
 PROJECT_RESTORABLE_STATUSES = {'toClaim', 'done', 'failed', 'removed'}
+PROJECT_STATUSES = {'active', 'archived'}
 
 
 def project_now_iso() -> str:
@@ -2323,6 +2367,77 @@ def load_projects() -> List[Dict[str, Any]]:
         '''
     ).fetchall()
     return [serialize_project_row(row, db=db) for row in rows]
+
+
+def set_project_status(project_key: str, status: str) -> Optional[Dict[str, Any]]:
+    """停用（archived）或恢复（active）项目；项目不存在返回 None。"""
+    normalized_key = normalize_project_key(project_key)
+    if not normalized_key:
+        raise ValueError('project_key 不能为空')
+    normalized_status = str(status or '').strip().lower()
+    if normalized_status not in PROJECT_STATUSES:
+        raise ValueError('status 仅支持 active / archived')
+
+    db = get_db()
+    now_str = project_now_iso()
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute(
+            'SELECT id FROM projects WHERE project_key = ? LIMIT 1',
+            (normalized_key,)
+        ).fetchone()
+        if not row:
+            db.rollback()
+            return None
+        db.execute(
+            'UPDATE projects SET status = ?, updated_at = ? WHERE id = ?',
+            (normalized_status, now_str, row['id'])
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return get_project_by_key(normalized_key)
+
+
+def delete_project(project_key: str) -> Optional[Dict[str, Any]]:
+    """删除项目及其邮箱池关联；正在领取中的邮箱会阻止删除。返回删除前的项目摘要。"""
+    normalized_key = normalize_project_key(project_key)
+    if not normalized_key:
+        raise ValueError('project_key 不能为空')
+
+    db = get_db()
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute(
+            'SELECT id FROM projects WHERE project_key = ? LIMIT 1',
+            (normalized_key,)
+        ).fetchone()
+        if not row:
+            db.rollback()
+            return None
+        project_id = int(row['id'])
+
+        claiming_count = int(
+            db.execute(
+                "SELECT COUNT(*) AS count FROM project_accounts WHERE project_id = ? AND status = 'claiming'",
+                (project_id,)
+            ).fetchone()['count']
+        )
+        if claiming_count:
+            db.rollback()
+            raise ValueError(f'有 {claiming_count} 个邮箱正在领取中，请先完成或释放后再删除项目')
+
+        summary = get_project_by_key(normalized_key, db=db)
+        db.execute('DELETE FROM project_account_events WHERE project_id = ?', (project_id,))
+        db.execute('DELETE FROM project_accounts WHERE project_id = ?', (project_id,))
+        db.execute('DELETE FROM project_group_scopes WHERE project_id = ?', (project_id,))
+        db.execute('DELETE FROM projects WHERE id = ?', (project_id,))
+        db.commit()
+        return summary
+    except Exception:
+        db.rollback()
+        raise
 
 
 def get_project_scope_accounts(project_id: int, db=None) -> List[sqlite3.Row]:
@@ -2607,7 +2722,6 @@ def start_project(
                     description = ?,
                     scope_mode = ?,
                     use_alias_email = ?,
-                    status = 'active',
                     last_scope_synced_at = ?,
                     updated_at = ?
                 WHERE id = ?
@@ -2716,9 +2830,12 @@ def claim_project_account(project_key: str, caller_id: str, task_id: str, lease_
             'SELECT * FROM projects WHERE project_key = ? LIMIT 1',
             (normalized_key,)
         ).fetchone()
-        if not project or project['status'] != 'active':
+        if not project:
             db.rollback()
-            return None
+            raise ValueError('项目不存在')
+        if project['status'] != 'active':
+            db.rollback()
+            raise ValueError('项目已停用（archived），无法领取项目邮箱')
 
         row = db.execute(
             '''
@@ -2742,6 +2859,14 @@ def claim_project_account(project_key: str, caller_id: str, task_id: str, lease_
             WHERE pa.project_id = ?
               AND pa.status = 'toClaim'
               AND a.status = 'active'
+              AND (NOT EXISTS (SELECT 1 FROM icloud_hme_aliases h WHERE h.address=pa.normalized_email)
+                   OR LOWER(a.email)=pa.normalized_email
+                   OR EXISTS (SELECT 1 FROM account_aliases aa WHERE aa.account_id=pa.account_id
+                        AND LOWER(aa.alias_email)=pa.normalized_email AND aa.icloud_alias_id IS NULL)
+                   OR EXISTS (SELECT 1 FROM icloud_hme_aliases h JOIN account_aliases aa ON aa.icloud_alias_id=h.id
+                        JOIN icloud_accounts ia ON ia.id=h.account_id WHERE h.address=pa.normalized_email
+                          AND aa.account_id=pa.account_id AND h.state='active' AND h.conflict=''
+                          AND ia.enabled=1 AND ia.binding_lost=0))
               AND NOT EXISTS (
                     SELECT 1 FROM project_accounts pa2
                     WHERE pa2.account_id = pa.account_id
@@ -3319,6 +3444,49 @@ def delete_accounts_by_ids(account_ids: List[int]) -> Dict[str, Any]:
             'deleted_count': len(existing_ids),
             'deleted_accounts': deleted_accounts,
             'missing_ids': missing_ids,
+        }
+    except Exception as e:
+        db.rollback()
+        return {'success': False, 'error': str(e)}
+
+
+def update_accounts_status_by_ids(account_ids: List[int], status: str) -> Dict[str, Any]:
+    """批量启用或停用账号，保留凭据和项目状态。"""
+    if status not in ('active', 'inactive'):
+        return {'success': False, 'error': '账号状态仅支持 active 或 inactive'}
+    if not isinstance(account_ids, list):
+        return {'success': False, 'error': 'account_ids 必须为账号 ID 列表'}
+    normalized_ids = normalize_account_ids(account_ids)
+    if not normalized_ids:
+        return {'success': False, 'error': '请选择要修改的账号'}
+
+    db = get_db()
+    placeholders = ','.join('?' * len(normalized_ids))
+    rows = db.execute(
+        f'SELECT id, email, status FROM accounts WHERE id IN ({placeholders}) ORDER BY id',
+        normalized_ids,
+    ).fetchall()
+    if not rows:
+        return {'success': False, 'error': '未找到可修改的账号'}
+
+    existing_ids = {row['id'] for row in rows}
+    updated_rows = [row for row in rows if row['status'] != status]
+    updated_ids = [row['id'] for row in updated_rows]
+    try:
+        if updated_ids:
+            update_placeholders = ','.join('?' * len(updated_ids))
+            db.execute(
+                f'''UPDATE accounts SET status = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id IN ({update_placeholders})''',
+                [status] + updated_ids,
+            )
+            db.commit()
+        return {
+            'success': True,
+            'updated_count': len(updated_ids),
+            'updated_accounts': [{'id': row['id'], 'email': row['email']} for row in updated_rows],
+            'unchanged_count': len(rows) - len(updated_rows),
+            'missing_ids': [account_id for account_id in normalized_ids if account_id not in existing_ids],
         }
     except Exception as e:
         db.rollback()

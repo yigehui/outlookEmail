@@ -39,6 +39,23 @@
 | GET | `/api/external/accounts` | API Key | JSON | 获取普通邮箱账号列表 |
 | GET | `/api/external/emails` | API Key | JSON | 获取指定邮箱邮件列表 |
 | POST | `/api/external/outlook/upload` | API Key | JSON | 上传 Outlook 邮箱账号密码到上传表（默认未授权，支持单条/批量） |
+| POST | `/api/external/accounts` | API Key（读写） | JSON | 批量导入正式邮箱账号（可指定分组、标签） |
+| DELETE | `/api/external/accounts/email/<email_addr>` | API Key（读写） | JSON | 按邮箱删除正式账号 |
+| POST | `/api/external/accounts/batch-update-group` | API Key（读写） | JSON | 批量修改账号分组 |
+| GET | `/api/external/projects` | API Key | JSON | 获取项目列表（含各状态计数） |
+| GET | `/api/external/projects/<project_key>` | API Key | JSON | 获取项目详情 |
+| GET | `/api/external/projects/<project_key>/accounts` | API Key | JSON | 查询项目邮箱池（支持 status/group_id/provider/keyword 过滤） |
+| POST | `/api/external/projects/start` | API Key（读写） | JSON | 创建项目或补全项目范围 |
+| POST | `/api/external/projects/<project_key>/claim-random` | API Key（读写） | JSON | 随机领取一个项目邮箱 |
+| POST | `/api/external/projects/<project_key>/complete-success` | API Key（读写） | JSON | 标记项目邮箱注册成功 |
+| POST | `/api/external/projects/<project_key>/complete-failed` | API Key（读写） | JSON | 标记项目邮箱注册失败 |
+| POST | `/api/external/projects/<project_key>/release` | API Key（读写） | JSON | 释放领取中的项目邮箱 |
+| POST | `/api/external/projects/<project_key>/reset-failed` | API Key（读写） | JSON | 把失败状态重置回可领取 |
+| POST | `/api/external/projects/<project_key>/remove-account` | API Key（读写） | JSON | 从项目移出邮箱 |
+| POST | `/api/external/projects/<project_key>/restore-account` | API Key（读写） | JSON | 恢复已移出的项目邮箱 |
+| POST | `/api/external/projects/<project_key>/archive` | API Key（读写） | JSON | 停用项目（停用后无法领取） |
+| POST | `/api/external/projects/<project_key>/restore` | API Key（读写） | JSON | 恢复停用的项目 |
+| DELETE | `/api/external/projects/<project_key>` | API Key（读写） | JSON | 删除项目及其邮箱池关联 |
 
 ### 分组、账号、标签、项目
 
@@ -73,6 +90,7 @@
 | GET | `/api/accounts/<account_id>/aliases` | Session | JSON | 获取账号别名 |
 | PUT | `/api/accounts/<account_id>/aliases` | Session + CSRF | JSON | 整体替换账号别名 |
 | POST | `/api/accounts/batch-update-group` | Session + CSRF | JSON | 批量改分组 |
+| POST | `/api/accounts/batch-update-status` | Session + CSRF | JSON | 批量启用或停用账号 |
 | POST | `/api/accounts/batch-update-forwarding` | Session + CSRF | JSON | 批量改转发开关 |
 | POST | `/api/accounts/batch-update-proxy` | Session + CSRF | JSON | 批量改账号级代理 |
 | GET | `/api/tags` | Session | JSON | 获取标签列表 |
@@ -90,6 +108,9 @@
 | POST | `/api/projects/<project_key>/reset-failed` | Session + CSRF | JSON | 把失败状态重置回可领取 |
 | POST | `/api/projects/<project_key>/remove-account` | Session + CSRF | JSON | 从项目移出邮箱 |
 | POST | `/api/projects/<project_key>/restore-account` | Session + CSRF | JSON | 恢复已移出的项目邮箱 |
+| POST | `/api/projects/<project_key>/archive` | Session + CSRF | JSON | 停用项目（停用后无法领取） |
+| POST | `/api/projects/<project_key>/restore` | Session + CSRF | JSON | 恢复停用的项目 |
+| DELETE | `/api/projects/<project_key>` | Session + CSRF | JSON | 删除项目及其邮箱池关联 |
 
 ### 刷新、日志、邮件、设置、临时邮箱
 
@@ -167,6 +188,13 @@
 - Query: `?api_key=your-api-key`
 
 可在 Web 界面 `设置 -> 对外 API Key` 中配置。
+
+API Key 分为两级权限（`设置 -> 对外 API Key 权限`，或通过 `GET/PUT /api/settings` 的 `external_api_key_permission` 字段读取与修改）：
+
+- `readonly`（默认）：保留升级前的全部对外能力，包括查询账号列表、查询邮件、上传 Outlook 暂存账号，以及查询项目列表与项目邮箱池
+- `readwrite`：额外开放正式账号的导入（`POST /api/external/accounts`）、删除（`DELETE /api/external/accounts/email/<email_addr>`）与批量改分组（`POST /api/external/accounts/batch-update-group`）端点，以及项目的启动/领取/回报操作（`start`、`claim-random`、`complete-success`、`complete-failed`、`release`、`reset-failed`、`remove-account`、`restore-account`）和生命周期操作（`archive`、`restore`、`DELETE /api/external/projects/<project_key>`）
+
+权限为 `readonly` 时调用读写端点返回 `403`，错误信息中包含切换指引；权限取值大小写不敏感，非法值写入时返回 `400`。
 
 ### 完整 API
 
@@ -591,6 +619,318 @@ curl -X POST -H "X-API-Key: your-api-key" -H "Content-Type: application/json" \
 - 请求体既无 `email` 也无非空 `accounts` 时返回 HTTP 400
 - 缺少 / 无效 API Key 时由鉴权层返回 HTTP 401 / 403
 
+### POST `/api/external/accounts`
+
+批量导入**正式邮箱账号**（写入 `accounts` 主表），需 API Key 且权限为读写（`readwrite`）。
+
+支持与 Web 端一致的账号串格式；Outlook 账号为 `邮箱----密码----第三段----第四段`（默认第三段是 Client ID、第四段是 Refresh Token；也可通过 `account_format` 指定相反顺序，系统会按 UUID 形态自动识别纠偏）。IMAP 账号支持 `邮箱----IMAP密码`（内置 provider）或 `邮箱----IMAP密码----IMAP主机----IMAP端口`（`provider` 为 `custom`）。
+
+#### 请求体
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `accounts` | string / array | 是 | 多行字符串（按换行拆分）或字符串数组；每行一条账号串，空行忽略 |
+| `account_format` | string | 否 | `client_id_refresh_token`（默认）或 `refresh_token_client_id` |
+| `group_id` | int | 否 | 目标分组 ID，默认 `1`；分组不存在返回 404 |
+| `provider` | string | 否 | 邮箱提供商标识，默认 `outlook`；未知值按邮箱地址推断，推断不出按 `custom` 处理 |
+| `remark` | string | 否 | 本次导入账号统一备注（最长 500 字符） |
+| `tag_ids` | int[] | 否 | 本次导入账号统一绑定的标签 ID 列表；不存在的标签 ID 会被忽略 |
+| `imap_host` | string | 否 | 自定义 IMAP 服务器地址（`provider=custom` 时必填） |
+| `imap_port` | int | 否 | IMAP 端口，默认 `993` |
+
+#### 请求示例
+
+```bash
+curl -X POST -H "X-API-Key: your-api-key" -H "Content-Type: application/json" \
+  -d '{"accounts":"a@outlook.com----pwd1----3f2504e0-4f89-11d3-9a0c-0305e82c3301----token1\nb@outlook.com----pwd2----3f2504e0-4f89-11d3-9a0c-0305e82c3302----token2","group_id":2,"tag_ids":[5]}' \
+  "http://localhost:5000/api/external/accounts"
+```
+
+#### 成功响应示例
+
+```json
+{
+  "success": true,
+  "message": "成功导入 2 个账号",
+  "added_count": 2,
+  "skipped_count": 0,
+  "invalid_count": 0,
+  "tagged_count": 2
+}
+```
+
+#### 返回说明
+
+- `added_count` / `skipped_count` / `invalid_count` / `tagged_count`：新增、重复跳过（邮箱已存在，不覆盖原记录）、格式无效、成功绑定标签的计数
+- 本次没有新账号被导入时返回 HTTP 400（`success: false`），响应体同样携带各计数
+- 密码、Refresh Token、IMAP 密码加密存储，响应不回显
+- 权限为 `readonly` 时返回 403，错误信息包含切换指引
+- 每次调用写入一条审计日志（`action=import`）
+
+### DELETE `/api/external/accounts/email/<email_addr>`
+
+按邮箱地址删除**正式邮箱账号**，需 API Key 且权限为读写（`readwrite`）。
+
+#### 请求示例
+
+```bash
+curl -X DELETE -H "X-API-Key: your-api-key" \
+  "http://localhost:5000/api/external/accounts/email/user%40outlook.com"
+```
+
+#### 成功响应示例
+
+```json
+{
+  "success": true,
+  "message": "已删除账号 user@outlook.com",
+  "deleted_email": "user@outlook.com"
+}
+```
+
+#### 返回说明
+
+- 路径中的邮箱地址建议 URL 编码（`@` 写作 `%40`），直接书写 `@` 或 `+` 也可以
+- 邮箱匹配大小写不敏感；传入别名邮箱时会删除其归属的主账号
+- `deleted_email` 返回库内的规范邮箱（可能是混合大小写或主邮箱，与请求地址不完全一致）
+- 账号不存在返回 HTTP 404
+- 删除会连带清理账号的标签、别名，并把项目关联记录标记为 `deleted`（项目历史保留）
+- 每次调用写入一条审计日志（`action=delete`）
+
+### POST `/api/external/accounts/batch-update-group`
+
+批量修改正式账号的分组，需 API Key 且权限为读写（`readwrite`）。适合设备端把已使用的账号挪到「已使用」等分组做视觉区分。
+
+#### 请求体
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `account_ids` | int[] | 是 | 账号 ID 列表；非法值（非正整数）会被自动过滤 |
+| `group_id` | int | 是 | 目标分组 ID |
+
+#### 请求示例
+
+```bash
+curl -X POST -H "X-API-Key: your-api-key" -H "Content-Type: application/json" \
+  -d '{"account_ids":[12,13],"group_id":3}' \
+  "http://localhost:5000/api/external/accounts/batch-update-group"
+```
+
+#### 成功响应示例
+
+```json
+{
+  "success": true,
+  "message": "已将 2 个账号移动到「已使用」分组",
+  "updated_count": 2
+}
+```
+
+#### 返回说明
+
+- `account_ids` 为空或全部非法返回 HTTP 400
+- 目标分组不存在返回 HTTP 404
+- 不能移动到系统分组（如「临时邮箱」），返回 HTTP 400
+- `updated_count` 是实际匹配到并被移动的账号数量；没有任何匹配账号时返回 HTTP 400
+- 每次调用写入一条审计日志（`action=update`）
+
+### 对外项目 API
+
+把项目管理能力开放给外部系统对接：查询类端点（项目列表、项目详情、项目邮箱池）使用任意权限的 API Key 即可访问；领取与回报类端点需要权限为读写（`readwrite`）。
+
+对外项目端点与 Web 端 `/api/projects/*` 共用同一套后端逻辑，语义完全一致：
+
+- 项目状态机（`toClaim` / `claiming` / `done` / `failed` / `removed` / `deleted`）、租约超时自动回收（默认 600 秒，最大 3600 秒）、同一邮箱多项目独立状态等规则见[项目管理](#项目管理)章节
+- `start` 的创建/补全、分组范围、别名邮箱入池、删除补偿规则同样适用
+- 项目的停用/恢复（`active` / `archived`）与删除端点同样开放，规则见[项目生命周期](#项目生命周期)
+- 响应结构镜像 Web 端（`data` 包装），列表查询额外在顶层返回 `total`
+
+#### GET `/api/external/projects`
+
+获取项目列表（含各状态计数）。响应结构与 `GET /api/projects` 一致，顶层额外带 `total`。
+
+```bash
+curl -H "X-API-Key: your-api-key" "http://localhost:5000/api/external/projects"
+```
+
+#### GET `/api/external/projects/<project_key>`
+
+获取单个项目详情；项目不存在返回 HTTP 404。
+
+#### GET `/api/external/projects/<project_key>/accounts`
+
+查询项目邮箱池，响应结构与 `GET /api/projects/<project_key>/accounts` 一致（含 `project` 统计与 `accounts` 明细），顶层额外带 `total`。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `status` | string | 否 | 按项目状态过滤，如 `toClaim`、`claiming`、`done`、`failed`、`removed` |
+| `group_id` | int | 否 | 按当前分组或项目来源分组过滤；会包含该分组及所有子分组 |
+| `provider` | string | 否 | 按邮箱 provider 过滤 |
+| `keyword` | string | 否 | 在邮箱地址、备注里做模糊搜索 |
+
+```bash
+curl -H "X-API-Key: your-api-key" \
+  "http://localhost:5000/api/external/projects/gpt/accounts?status=toClaim"
+```
+
+典型用法：外部系统用 `status=toClaim` 查询未注册邮箱池，用 `status=done` 查询已注册邮箱池，实现按渠道排除已注册邮箱。
+
+#### POST `/api/external/projects/start`
+
+创建项目或补全项目范围，需读写权限。请求体与 `POST /api/projects/start` 一致（`project_key` 必填，`name` / `description` / `group_ids` / `use_alias_email` 可选）。
+
+```bash
+curl -X POST -H "X-API-Key: your-api-key" -H "Content-Type: application/json" \
+  -d '{"project_key":"gpt","name":"GPT 注册","group_ids":[1,2]}' \
+  "http://localhost:5000/api/external/projects/start"
+```
+
+#### POST `/api/external/projects/<project_key>/claim-random`
+
+从项目里领取一个可用邮箱，需读写权限。请求体与 Web 端一致：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `caller_id` | string | 是 | 调用方标识 |
+| `task_id` | string | 是 | 当前任务标识 |
+| `lease_seconds` | int | 否 | 租期秒数，默认 `600`，最大 `3600`；超时未回报会自动回收到 `toClaim` |
+
+```bash
+curl -X POST -H "X-API-Key: your-api-key" -H "Content-Type: application/json" \
+  -d '{"caller_id":"worker-1","task_id":"task-001","lease_seconds":600}' \
+  "http://localhost:5000/api/external/projects/gpt/claim-random"
+```
+
+成功响应示例：
+
+```json
+{
+  "success": true,
+  "data": {
+    "project_key": "gpt",
+    "project_account_id": 101,
+    "account_id": 12,
+    "email": "user@example.com",
+    "primary_email": "user@example.com",
+    "group_id": 1,
+    "provider": "outlook",
+    "account_type": "outlook",
+    "remark": "",
+    "claim_token": "pclm_xxx",
+    "claimed_at": "2026-04-15T10:00:00+00:00",
+    "lease_expires_at": "2026-04-15T10:10:00+00:00"
+  }
+}
+```
+
+- 领取的邮箱处于 `claiming` 状态并持有 `claim_token`，后续回报必须携带
+- 项目内无可领取邮箱时返回 HTTP 200 + `{"success": false, "error": "没有可领取的项目邮箱"}`
+- 项目不存在返回 HTTP 404（与 Web 端不同，便于外部脚本区分配置错误与池耗尽）
+- 项目处于停用状态（`archived`）时返回 HTTP 400，错误信息为「项目已停用」
+
+#### POST `/api/external/projects/<project_key>/complete-success`
+
+把领取中的邮箱标记为注册成功（`claiming` → `done`），需读写权限。请求体与 Web 端一致：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `account_id` | int | 是 | 领取响应中的账号 ID |
+| `claim_token` | string | 是 | 领取时返回的 token |
+| `caller_id` | string | 否 | 调用方标识 |
+| `task_id` | string | 否 | 任务标识 |
+| `detail` | string | 否 | 成功说明（最长 500 字符） |
+
+`done` 状态的邮箱不会再被本项目分配，即「该邮箱已在此渠道注册」。
+
+#### POST `/api/external/projects/<project_key>/complete-failed`
+
+把领取中的邮箱标记为注册失败（`claiming` → `failed`），需读写权限。请求体与 `complete-success` 一致；`failed` 不会自动再次参与分配，需调用 `reset-failed` 重置。
+
+#### POST `/api/external/projects/<project_key>/release`
+
+主动释放领取中的邮箱（`claiming` → `toClaim`），适合任务中断、主动放弃等场景，需读写权限。请求体与 `complete-success` 一致。
+
+#### POST `/api/external/projects/<project_key>/reset-failed`
+
+把 `failed` 邮箱重置回 `toClaim`，需读写权限。请求体只需 `account_id`（必填）与 `detail`（可选）。
+
+#### POST `/api/external/projects/<project_key>/remove-account`
+
+把项目邮箱移出项目范围（目标状态 `removed`；`claiming` 中会拒绝），需读写权限。请求体只需 `account_id` 与可选 `detail`。
+
+#### POST `/api/external/projects/<project_key>/restore-account`
+
+把 `removed` 项目邮箱恢复回 `toClaim`，需读写权限。请求体只需 `account_id` 与可选 `detail`。
+
+#### POST `/api/external/projects/<project_key>/archive`
+
+停用项目（`active` → `archived`），需读写权限。停用后：
+
+- `claim-random` 返回 HTTP 400「项目已停用」
+- 项目的查询、回报类端点（`complete-success` / `complete-failed` / `release` 等）仍可正常使用，便于收尾在途任务
+- 再次调用 `start` 只会补全范围，**不会**把项目重新激活；恢复需显式调用 `restore`
+
+```bash
+curl -X POST -H "X-API-Key: your-api-key" \
+  "http://localhost:5000/api/external/projects/gpt/archive"
+```
+
+#### POST `/api/external/projects/<project_key>/restore`
+
+恢复停用的项目（`archived` → `active`），需读写权限。恢复后 `claim-random` 立即可用，项目内各邮箱状态保持不变。
+
+```bash
+curl -X POST -H "X-API-Key: your-api-key" \
+  "http://localhost:5000/api/external/projects/gpt/restore"
+```
+
+#### DELETE `/api/external/projects/<project_key>`
+
+删除项目及其邮箱池关联，需读写权限。
+
+```bash
+curl -X DELETE -H "X-API-Key: your-api-key" \
+  "http://localhost:5000/api/external/projects/gpt"
+```
+
+删除规则：
+
+- 删除的是项目本身与「邮箱 ↔ 项目」关联（含项目事件历史），**不会**删除 `accounts` 主表里的账号
+- 存在 `claiming` 状态（正在领取中）的邮箱时拒绝删除，返回 HTTP 400 并提示数量；先 `complete-*` 或 `release` 后即可删除
+- 删除不可恢复；若之后用同一 `project_key` 重新 `start`，会创建全新项目、按当前范围重新入池
+- 项目不存在返回 HTTP 404
+- 每次调用写入一条审计日志（`action=delete`）
+
+#### 对接示例与通用行为
+
+完整外部对接流程：
+
+```bash
+# 1. 启动/同步项目（首次调用即创建）
+curl -X POST -H "X-API-Key: your-api-key" -H "Content-Type: application/json" \
+  -d '{"project_key":"gpt"}' "http://localhost:5000/api/external/projects/start"
+
+# 2. 查询未注册邮箱池
+curl -H "X-API-Key: your-api-key" \
+  "http://localhost:5000/api/external/projects/gpt/accounts?status=toClaim"
+
+# 3. 领取邮箱并执行注册流程
+CLAIM=$(curl -s -X POST -H "X-API-Key: your-api-key" -H "Content-Type: application/json" \
+  -d '{"caller_id":"worker-1","task_id":"task-001"}' \
+  "http://localhost:5000/api/external/projects/gpt/claim-random")
+
+# 4. 注册完成后回报结果
+curl -X POST -H "X-API-Key: your-api-key" -H "Content-Type: application/json" \
+  -d "{\"account_id\":12,\"claim_token\":\"pclm_xxx\",\"caller_id\":\"worker-1\",\"detail\":\"注册成功\"}" \
+  "http://localhost:5000/api/external/projects/gpt/complete-success"
+```
+
+通用行为：
+
+- 回报类端点在 `account_id` / `claim_token` 不匹配当前 `claiming` 记录时返回 HTTP 400（`项目账号状态不匹配`）；`account_id` 非整数返回 HTTP 400（`account_id 无效`）
+- 权限为 `readonly` 时调用读写端点返回 HTTP 403，错误信息包含切换指引
+- 所有读写操作写入审计日志（`action` 为 `start` / `claim` / `complete` / `release` / `reset` / `remove` / `restore`，`resource_type=project`），项目状态流转同时记录项目事件供 Web 端追溯
+
 ### Outlook 上传账号管理
 
 这些接口用于 Web 管理端维护 `outlook_upload_accounts` 中的 Outlook 自动化授权账号。
@@ -769,6 +1109,11 @@ curl -X POST -H "X-API-Key: your-api-key" -H "Content-Type: application/json" \
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | `group_id` | int | 否 | 返回指定分组及所有子分组下的账号 |
+| `tag_ids` | string | 否 | 逗号分隔的标签 ID，仅返回包含任一标签的账号 |
+| `exclude_tag_ids` | string | 否 | 要排除的标签 ID；支持 `exclude_tag_ids=1,2` 或重复传递 `exclude_tag_ids=1&exclude_tag_ids=2`，返回账号不得拥有其中任一标签 |
+| `include_untagged` | bool | 否 | 与 `tag_ids` 配合使用，是否包含未打标签账号 |
+
+同时传入 `tag_ids` 与 `exclude_tag_ids` 时，账号需拥有 `tag_ids` 中至少一个标签，且不拥有 `exclude_tag_ids` 中任一标签。`include_untagged` 会先与包含标签条件取并集，再执行排除条件。
 
 #### 响应重点字段
 
@@ -803,7 +1148,10 @@ curl -X POST -H "X-API-Key: your-api-key" -H "Content-Type: application/json" \
 | `sort_order` | string | 否 | 排序方向，`asc` 或 `desc`，默认 `desc` |
 | `group_id` | int | 否 | 仅搜索指定分组及所有子分组下的账号，不传则搜索全部分组 |
 | `tag_ids` | string | 否 | 逗号分隔的标签 ID，仅搜索包含任一标签的账号 |
+| `exclude_tag_ids` | string | 否 | 要排除的标签 ID；支持 `exclude_tag_ids=1,2` 或重复传递 `exclude_tag_ids=1&exclude_tag_ids=2`，返回账号不得拥有其中任一标签 |
 | `include_untagged` | bool | 否 | 与 `tag_ids` 配合使用，是否包含未打标签账号 |
+
+同时传入 `tag_ids` 与 `exclude_tag_ids` 时，账号需拥有 `tag_ids` 中至少一个标签，且不拥有 `exclude_tag_ids` 中任一标签。`include_untagged` 会先与包含标签条件取并集，再执行排除条件。
 
 ### POST `/api/accounts`
 
@@ -1109,6 +1457,24 @@ Content-Type: application/json
 }
 ```
 
+### POST `/api/accounts/batch-update-status`
+
+批量启用或停用正式邮箱账号，使用登录会话和 CSRF 校验。
+
+```json
+{
+  "account_ids": [1, 2, 3],
+  "status": "inactive"
+}
+```
+
+- `account_ids` 为账号 ID 数组，重复 ID 会去重，无效 ID 会忽略。
+- `status` 必须为 `active`（启用）或 `inactive`（停用）。
+- 返回 `updated_count`、`updated_accounts`、`unchanged_count` 和 `missing_ids`，已处于目标状态的账号不会重复更新。
+- 请求体或状态无效、没有可修改账号时返回 HTTP 400；未登录返回 HTTP 401。
+- 停用保留账号凭据和项目记录，后续项目领取、Token 刷新和自动转发会跳过该账号。已有项目领取状态不会被撤销；恢复启用也不会重置项目进度。
+- 主页支持批量启用和停用；Token 刷新管理仅展示启用的 Outlook 账号，可批量停用，恢复请使用主页入口。
+
 ### POST `/api/accounts/batch-update-forwarding`
 
 批量开启或关闭账号转发。
@@ -1264,6 +1630,10 @@ Content-Type: application/json
   - `removed`：人工移出项目范围
   - `deleted`：系统主表里的账号已删除，但项目历史仍保留
 
+项目自身的启用/停用与删除见[项目生命周期](#项目生命周期)。
+
+Web 端提供项目管理界面：在「设置 → 常规设置 → 项目管理入口」开启后（默认关闭），顶部导航出现「项目管理」入口，支持创建项目、查看各状态计数、停用/恢复与删除；接口能力与本节完全一致。
+
 ### GET `/api/projects`
 
 获取项目列表。
@@ -1304,6 +1674,42 @@ Content-Type: application/json
 
 获取单个项目详情。
 
+### 项目生命周期
+
+项目自身有 `status` 字段，取值 `active`（默认）或 `archived`（停用）：
+
+- 停用后 `claim-random` 拒绝领取（HTTP 400「项目已停用」），池耗尽仍是 HTTP 200，两者可区分
+- 停用不影响查询与回报类操作，在途的 `claiming` 邮箱仍可 `complete-*` 或 `release`
+- 再次 `start` 不会重新激活停用的项目，只会照常补全范围；恢复需调用 `restore`
+- 删除项目会移除项目本身、邮箱池关联（`project_accounts`）、分组范围与项目事件历史；`accounts` 主表里的账号不受影响
+- 存在 `claiming` 状态的邮箱时删除会被拒绝，先完成或释放后重试
+- 用同一 `project_key` 在删除后重新 `start` 会创建全新项目
+
+### POST `/api/projects/<project_key>/archive`
+
+停用项目（`active` → `archived`）。
+
+### POST `/api/projects/<project_key>/restore`
+
+恢复停用的项目（`archived` → `active`），项目内各邮箱状态保持不变。
+
+### DELETE `/api/projects/<project_key>`
+
+删除项目及其邮箱池关联（不影响账号本身）；有邮箱正在领取中时返回 HTTP 400。
+
+成功响应示例：
+
+```json
+{
+  "success": true,
+  "message": "已删除项目 gpt",
+  "deleted_project": {
+    "project_key": "gpt",
+    "total_count": 500
+  }
+}
+```
+
 ### POST `/api/projects/start`
 
 启动项目。
@@ -1319,6 +1725,7 @@ Content-Type: application/json
   - 默认沿用原有范围
   - 如果本次显式传了 `group_ids`，会更新范围后再补全
   - 只补新增邮箱，不会重置已有项目状态
+  - 不会改变项目的 `active` / `archived` 状态；停用的项目照常补全范围，但恢复需要显式调用 `restore`
 
 删除补偿规则：
 
@@ -1535,6 +1942,8 @@ Content-Type: application/json
 }
 ```
 
+项目不存在或项目已停用（`archived`）时返回 HTTP 400，错误信息分别为「项目不存在」「项目已停用（archived），无法领取项目邮箱」。
+
 ### POST `/api/projects/<project_key>/complete-success`
 
 把当前领取中的项目邮箱标记为成功。
@@ -1635,10 +2044,13 @@ Content-Type: application/json
 | GET | `/api/accounts/trigger-scheduled-refresh` | Query: `force=true/false` | 手动触发一次“定时刷新”逻辑，返回 `text/event-stream` |
 | POST | `/api/accounts/stop-full-refresh` | 无 | 请求停止当前全量刷新任务 |
 
+单账号刷新与重试成功时返回 `token_rotated` 和 `message`：仅当新 Refresh Token 与旧值不同且成功写库，`token_rotated` 才为 `true`，文案为“刷新成功，Token 已更新”；未返回新值或返回旧值时为 `false`，文案为“验证成功，Token 未轮换，继续使用原 Token”。成功获取新值但保存失败会返回刷新失败。
+
 `/api/accounts/refresh-all`、`/api/accounts/refresh-failed-stream`、`/api/accounts/refresh-selected-stream/<task_id>`、`/api/accounts/trigger-scheduled-refresh` 都会返回 SSE 事件流，常见事件类型包括：
 
 - `start`
 - `progress`
+- `account_result`：包含单账号的 `status`、`message` 和 `token_rotated`
 - `delay`
 - `complete`
 
@@ -1693,6 +2105,8 @@ Content-Type: application/json
 - `requested_count`
 - `processed_count`
 - `success_count`
+- `rotated_count`：成功且 Token 已轮换的账号数
+- `unrotated_count`：成功但 Token 未轮换的账号数
 - `failed_count`
 - `skipped_count`
 - `failed_list`
@@ -1709,6 +2123,10 @@ Content-Type: application/json
 | GET | `/api/accounts/refresh-status-list` | Query: `q`、`status`、`page`、`page_size` | 获取 Token 刷新管理邮箱列表 |
 
 `GET /api/accounts/refresh-logs/failed` 返回的是“当前仍处于失败状态的邮箱快照”，不再是历史失败日志列表。
+
+全局与单账号刷新日志包含 `token_rotated`（`true` / `false` / `null`）和对应的 `message`。旧日志的轮换结果为 `null`，表示未记录，不能推断为未轮换。刷新管理列表通过 `last_refresh_token_rotated` 返回最近一次结果，并展示三个独立时间：`last_refresh_at` 表示最近一次请求，`last_refresh_success_at` 表示最近一次成功刷新（未轮换也算成功），`refresh_token_updated_at` 表示最近一次 Token 更新。失败不覆盖成功时间，未轮换不覆盖 Token 更新时间；未知时间返回 `null`，界面显示 `-`。
+
+单账号刷新响应和 SSE 的 `account_result` 同时返回这三个数据库时间。旧账号首次迁移时会从成功日志和最近成功状态恢复可确认的成功时间，无记录的保持为空。
 
 `GET /api/accounts/refresh-status-list` 查询参数：
 
@@ -2240,6 +2658,7 @@ POST /api/cloudflare/channels
 | --- | --- |
 | `login_password_masked` | 登录密码掩码 |
 | `external_api_key` | 当前对外 API Key |
+| `external_api_key_permission` | 对外 API Key 权限级别，未配置时返回 `readonly` |
 | `duckmail_base_url` | DuckMail API 地址 |
 | `duckmail_api_key` | DuckMail API Key |
 | `cloudflare_worker_domain` | 旧单渠道 Cloudflare Worker 域名，主要用于升级迁移 |
@@ -2255,6 +2674,7 @@ POST /api/cloudflare/channels
 | `mail_fetch_timeout_seconds` | 普通 Outlook/IMAP 读取邮件列表的整体超时秒数，范围 `30-300`，默认 `120` |
 | `show_account_created_at` | 是否在邮箱列表展示创建时间 |
 | `show_account_sort_order` | 是否在邮箱列表展示自定义排序值 |
+| `show_project_management` | 是否在顶部导航展示「项目管理」入口，未配置时返回 `false` |
 | `active_skin_id` | 当前实际生效皮肤 ID；配置不可用时会返回 `classic` |
 | `configured_skin_id` | 当前保存的皮肤 ID；可能因为皮肤不可用而与 `active_skin_id` 不同 |
 | `active_skin` | 当前实际生效皮肤对象 |
@@ -2267,6 +2687,7 @@ POST /api/cloudflare/channels
 | `forward_account_delay_seconds` | 串行模式下账号间隔秒数；并行模式返回 `0` |
 | `forward_email_window_minutes` | 转发时间窗口 |
 | `forward_include_junkemail` | 是否转发垃圾箱 |
+| `forward_keywords` | 转发关键词文本，每行一个，默认空字符串（全部转发） |
 | `email_forward_recipient` | SMTP 转发收件人 |
 | `smtp_host` | SMTP 主机 |
 | `smtp_port` | SMTP 端口 |
@@ -2301,8 +2722,10 @@ POST /api/cloudflare/channels
 | `mail_fetch_timeout_seconds` | int | 普通 Outlook/IMAP 邮件列表整体获取超时，范围 `30-300`；未传则保留现有值。尚未保存该设置时回退环境变量 `MAIL_FETCH_OVERALL_TIMEOUT`，再回退 `120` |
 | `show_account_created_at` | bool | 是否在邮箱列表展示创建时间 |
 | `show_account_sort_order` | bool | 是否在邮箱列表展示自定义排序值 |
+| `show_project_management` | bool | 是否在顶部导航展示「项目管理」入口；默认关闭，开启后可在网页上创建项目、查看计数、停用/恢复与删除 |
 | `active_skin_id` | string | 当前系统级外观皮肤 ID；所有登录设备共用同一设置 |
 | `external_api_key` | string | 对外 API Key，可传空字符串清空 |
+| `external_api_key_permission` | string | 对外 API Key 权限：`readonly` 或 `readwrite`，大小写不敏感；非法值返回 HTTP 400，不传该字段时保持现有值 |
 | `normal_mail_local_retention_enabled` | bool/string | 是否启用普通邮箱本地保留；通过 `/api/settings` 更新会同步刷新后端进程内读取缓存 |
 
 说明：修改 `login_password` 时必须提供正确的 `current_login_password`；改密成功后服务端会轮换登录会话版本，其他已登录的 Web Session 需要重新登录，当前改密会话保持有效。
@@ -2334,6 +2757,7 @@ POST /api/cloudflare/channels
 | `forward_account_delay_seconds` | int | 串行模式下账号间隔，范围 `0-60`；并行模式会保存为 `0` |
 | `forward_email_window_minutes` | int | 转发邮件时间范围，范围 `0-10080`，`0` 表示不限制 |
 | `forward_include_junkemail` | bool | 是否把垃圾箱邮件也纳入转发轮询 |
+| `forward_keywords` | string | 每行一个关键词，主题或完整可见正文包含任一项才转发，不区分大小写；空字符串关闭筛选，保存时去除空行及重复项 |
 | `forward_channels` | array<string> | `smtp` / `telegram` / `wecom` |
 | `email_forward_recipient` | string | SMTP 转发收件人 |
 | `smtp_host` | string | SMTP 主机 |
@@ -2358,6 +2782,7 @@ POST /api/cloudflare/channels
   "forward_account_delay_seconds": 0,
   "forward_email_window_minutes": 30,
   "forward_include_junkemail": true,
+  "forward_keywords": "Access deactivated\n账号已停用",
   "smtp_provider": "outlook",
   "forward_channels": ["smtp", "telegram"]
 }

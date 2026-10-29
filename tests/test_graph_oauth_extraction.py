@@ -412,6 +412,7 @@ class GraphOauthRouteTests(unittest.TestCase):
         scope = extract_mock.call_args.kwargs['scope']
         self.assertIn('https://graph.microsoft.com/Mail.Read', scope)
         self.assertIn('https://graph.microsoft.com/Mail.ReadWrite', scope)
+        self.assertIn('https://graph.microsoft.com/Mail.Send', scope)
         self.assertIn('https://graph.microsoft.com/User.Read', scope)
 
     def test_stream_default_mode_uses_graph_scope(self):
@@ -430,6 +431,7 @@ class GraphOauthRouteTests(unittest.TestCase):
         scope = extract_mock.call_args.kwargs['scope']
         self.assertIn('https://graph.microsoft.com/Mail.Read', scope)
         self.assertIn('https://graph.microsoft.com/Mail.ReadWrite', scope)
+        self.assertIn('https://graph.microsoft.com/Mail.Send', scope)
         self.assertIn('https://graph.microsoft.com/User.Read', scope)
 
     def test_stream_imap_mode_uses_imap_scope(self):
@@ -446,6 +448,7 @@ class GraphOauthRouteTests(unittest.TestCase):
         self.assertTrue(events[-1]['success'])
         self.assertEqual(extract_mock.call_args.kwargs['scope'], web_outlook_app.GRAPH_EXTRACT_SCOPE)
         self.assertIn('https://outlook.office.com/IMAP.AccessAsUser.All', extract_mock.call_args.kwargs['scope'])
+        self.assertNotIn('https://graph.microsoft.com/Mail.Send', extract_mock.call_args.kwargs['scope'])
 
     def _fake_run_graph_oauth_task(self, account_id, sub_q, mode="graph", bind_secondary=None):
         sub_q.put({"type": "success", "success": True, "account_id": account_id})

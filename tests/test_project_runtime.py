@@ -87,6 +87,93 @@ class ProjectRuntimeTests(unittest.TestCase):
             db.commit()
             return int(cursor.lastrowid)
 
+    def test_batch_account_status_preserves_data_and_controls_account_eligibility(self):
+        account_id = self._insert_account('batch-status@example.com')
+        inactive_id = self._insert_account('already-inactive@example.com', status='inactive')
+        unselected_id = self._insert_account('unselected-status@example.com')
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute(
+                '''UPDATE accounts SET password = ?, refresh_token = ?, forward_enabled = 1,
+                   last_refresh_status = 'failed', last_refresh_error = 'expired' WHERE id = ?''',
+                (web_outlook_app.encrypt_data('saved-password'),
+                 web_outlook_app.encrypt_data('saved-token'), account_id),
+            )
+            db.commit()
+            before = dict(db.execute('SELECT * FROM accounts WHERE id = ?', (account_id,)).fetchone())
+            web_outlook_app.start_project('batch-status')
+
+        response = self.client.post('/api/accounts/batch-update-status', json={
+            'account_ids': [account_id, str(account_id), inactive_id, 99999999, 'invalid', -1],
+            'status': 'inactive',
+        })
+        self.assertEqual(response.status_code, 200)
+        result = response.get_json()
+        self.assertTrue(result['success'])
+        self.assertEqual(result['updated_count'], 1)
+        self.assertEqual(result['unchanged_count'], 1)
+        self.assertEqual(result['missing_ids'], [99999999])
+        self.assertEqual(result['updated_accounts'], [{'id': account_id, 'email': before['email']}])
+
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            after = dict(db.execute('SELECT * FROM accounts WHERE id = ?', (account_id,)).fetchone())
+            self.assertEqual(after['status'], 'inactive')
+            for key in before.keys() - {'status', 'updated_at'}:
+                self.assertEqual(after[key], before[key], key)
+            self.assertEqual(web_outlook_app.query_refreshable_accounts()['total'], 1)
+            self.assertEqual(web_outlook_app.get_forwarding_enabled_accounts(), [])
+            claim = web_outlook_app.claim_project_account('batch-status', 'worker', 'unselected')
+            self.assertEqual(claim['account_id'], unselected_id)
+            self.assertTrue(web_outlook_app.complete_project_account_success(
+                'batch-status', unselected_id, claim['claim_token'],
+            ))
+            self.assertIsNone(web_outlook_app.claim_project_account('batch-status', 'worker', 'task'))
+
+        # 停用账号仍在主页列表中，允许批量恢复。
+        accounts = self.client.get('/api/accounts/search?q=batch-status').get_json()['accounts']
+        self.assertEqual(accounts[0]['status'], 'inactive')
+        restored = self.client.post('/api/accounts/batch-update-status', json={
+            'account_ids': [account_id, inactive_id], 'status': 'active',
+        }).get_json()
+        self.assertTrue(restored['success'])
+        self.assertEqual(restored['updated_count'], 2)
+        with self.app.app_context():
+            self.assertEqual(web_outlook_app.query_refreshable_accounts()['total'], 3)
+            self.assertEqual([a['id'] for a in web_outlook_app.get_forwarding_enabled_accounts()], [account_id])
+            claim = web_outlook_app.claim_project_account('batch-status', 'worker', 'task')
+            self.assertIn(claim['account_id'], [account_id, inactive_id])
+
+        unchanged = self.client.post('/api/accounts/batch-update-status', json={
+            'account_ids': [account_id, inactive_id], 'status': 'active',
+        }).get_json()
+        self.assertTrue(unchanged['success'])
+        self.assertEqual(unchanged['updated_count'], 0)
+        self.assertEqual(unchanged['unchanged_count'], 2)
+
+    def test_batch_account_status_rejects_invalid_requests_and_requires_login(self):
+        account_id = self._insert_account('invalid-batch-status@example.com')
+        for payload in [
+            {}, [], {'account_ids': [account_id]},
+            {'account_ids': [account_id], 'status': 'deleted'},
+            {'account_ids': [account_id], 'status': ['inactive']},
+            {'account_ids': str(account_id), 'status': 'inactive'},
+            {'account_ids': [], 'status': 'inactive'},
+            {'account_ids': [99999999], 'status': 'inactive'},
+        ]:
+            with self.subTest(payload=payload):
+                response = self.client.post('/api/accounts/batch-update-status', json=payload)
+                self.assertEqual(response.status_code, 400)
+                self.assertFalse(response.get_json()['success'])
+        with self.app.app_context():
+            row = web_outlook_app.get_db().execute('SELECT status FROM accounts WHERE id = ?', (account_id,)).fetchone()
+            self.assertEqual(row['status'], 'active')
+        response = self.app.test_client().post('/api/accounts/batch-update-status', json={
+            'account_ids': [account_id], 'status': 'inactive',
+        })
+        self.assertEqual(response.status_code, 401)
+        self.assertFalse(response.get_json()['success'])
+
     def _set_group_sort_order(self, group_id: int, sort_order: int):
         with self.app.app_context():
             db = web_outlook_app.get_db()
@@ -1064,6 +1151,203 @@ class ProjectRuntimeTests(unittest.TestCase):
             ]
         )
         self.assertNotIn(untagged_id, [account['id'] for account in payload['accounts']])
+
+    def test_account_list_supports_include_exclude_and_untagged_tag_filters(self):
+        tag_a_id = self._create_tag('标签 A')
+        tag_b_id = self._create_tag('标签 B')
+        tag_c_id = self._create_tag('标签 C')
+        a_only_id = self._insert_account('tag-a-only@example.com')
+        b_only_id = self._insert_account('tag-b-only@example.com')
+        a_and_b_id = self._insert_account('tag-a-and-b@example.com')
+        c_only_id = self._insert_account('tag-c-only@example.com')
+        untagged_id = self._insert_account('tag-untagged@example.com')
+
+        self._tag_account(a_only_id, tag_a_id)
+        self._tag_account(b_only_id, tag_b_id)
+        self._tag_account(a_and_b_id, tag_a_id)
+        self._tag_account(a_and_b_id, tag_b_id)
+        self._tag_account(c_only_id, tag_c_id)
+
+        def get_account_ids(query_string):
+            response = self.client.get('/api/accounts', query_string=query_string)
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertTrue(payload['success'])
+            return payload['total'], {account['id'] for account in payload['accounts']}
+
+        total, account_ids = get_account_ids({
+            'tag_ids': f'{tag_a_id},{tag_b_id}',
+            'sort_by': 'email',
+            'sort_order': 'asc',
+        })
+        self.assertEqual(total, 3)
+        self.assertEqual(account_ids, {a_only_id, b_only_id, a_and_b_id})
+
+        total, account_ids = get_account_ids([
+            ('exclude_tag_ids', str(tag_b_id)),
+            ('exclude_tag_ids', str(tag_b_id)),
+            ('sort_by', 'email'),
+            ('sort_order', 'asc'),
+        ])
+        self.assertEqual(total, 3)
+        self.assertEqual(account_ids, {a_only_id, c_only_id, untagged_id})
+
+        total, account_ids = get_account_ids({
+            'exclude_tag_ids': f'{tag_b_id},{tag_c_id}',
+            'sort_by': 'email',
+            'sort_order': 'asc',
+        })
+        self.assertEqual(total, 2)
+        self.assertEqual(account_ids, {a_only_id, untagged_id})
+
+        total, account_ids = get_account_ids([
+            ('tag_ids', str(tag_a_id)),
+            ('exclude_tag_ids', str(tag_b_id)),
+            ('sort_by', 'email'),
+            ('sort_order', 'asc'),
+        ])
+        self.assertEqual(total, 1)
+        self.assertEqual(account_ids, {a_only_id})
+
+        total, account_ids = get_account_ids({
+            'tag_ids': str(tag_a_id),
+            'include_untagged': '1',
+            'sort_by': 'email',
+            'sort_order': 'asc',
+        })
+        self.assertEqual(total, 3)
+        self.assertEqual(account_ids, {a_only_id, a_and_b_id, untagged_id})
+
+    def test_account_list_request_args_accepts_csv_repeated_and_mixed_exclude_tag_ids(self):
+        cases = (
+            ('/api/accounts?exclude_tag_ids=1,2', [1, 2]),
+            ('/api/accounts?exclude_tag_ids=1&exclude_tag_ids=2', [1, 2]),
+            ('/api/accounts?exclude_tag_ids=1,2&exclude_tag_ids=2,3', [1, 2, 3]),
+        )
+
+        for path, expected_tag_ids in cases:
+            with self.app.test_request_context(path):
+                list_args = web_outlook_app.get_account_list_request_args()
+            self.assertEqual(list_args['exclude_tag_ids'], expected_tag_ids)
+
+    def test_account_list_and_search_combine_untagged_with_multiple_excluded_tags(self):
+        tag_a_id = self._create_tag('多排除标签 A')
+        tag_b_id = self._create_tag('多排除标签 B')
+        tag_c_id = self._create_tag('多排除标签 C')
+        a_only_id = self._insert_account('multi-exclude-a-only@example.com')
+        a_and_b_id = self._insert_account('multi-exclude-a-b@example.com')
+        a_and_c_id = self._insert_account('multi-exclude-a-c@example.com')
+        b_only_id = self._insert_account('multi-exclude-b-only@example.com')
+        c_only_id = self._insert_account('multi-exclude-c-only@example.com')
+        untagged_id = self._insert_account('multi-exclude-untagged@example.com')
+
+        self._tag_account(a_only_id, tag_a_id)
+        self._tag_account(a_and_b_id, tag_a_id)
+        self._tag_account(a_and_b_id, tag_b_id)
+        self._tag_account(a_and_c_id, tag_a_id)
+        self._tag_account(a_and_c_id, tag_c_id)
+        self._tag_account(b_only_id, tag_b_id)
+        self._tag_account(c_only_id, tag_c_id)
+
+        query_string = [
+            ('tag_ids', str(tag_a_id)),
+            ('include_untagged', '1'),
+            ('exclude_tag_ids', str(tag_b_id)),
+            ('exclude_tag_ids', str(tag_c_id)),
+            ('sort_by', 'email'),
+            ('sort_order', 'asc'),
+        ]
+        response = self.client.get('/api/accounts', query_string=query_string)
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['total'], 2)
+        self.assertEqual({account['id'] for account in payload['accounts']}, {a_only_id, untagged_id})
+
+        search_response = self.client.get('/api/accounts/search', query_string=query_string + [
+            ('q', 'multi-exclude'),
+        ])
+        self.assertEqual(search_response.status_code, 200)
+        search_payload = search_response.get_json()
+        self.assertTrue(search_payload['success'])
+        self.assertEqual(search_payload['total'], 2)
+        self.assertEqual(
+            {account['id'] for account in search_payload['accounts']},
+            {a_only_id, untagged_id},
+        )
+
+        comma_search_response = self.client.get('/api/accounts/search', query_string={
+            'q': 'multi-exclude',
+            'tag_ids': str(tag_a_id),
+            'include_untagged': '1',
+            'exclude_tag_ids': f'{tag_b_id},{tag_c_id}',
+            'sort_by': 'email',
+            'sort_order': 'asc',
+        })
+        self.assertEqual(comma_search_response.status_code, 200)
+        comma_search_payload = comma_search_response.get_json()
+        self.assertTrue(comma_search_payload['success'])
+        self.assertEqual(comma_search_payload['total'], 2)
+        self.assertEqual(
+            {account['id'] for account in comma_search_payload['accounts']},
+            {a_only_id, untagged_id},
+        )
+
+    def test_account_search_count_pagination_and_descendants_share_exclude_tag_filter(self):
+        with self.app.app_context():
+            parent_group_id = web_outlook_app.add_group('标签筛选父分组')
+            child_group_id = web_outlook_app.add_group('标签筛选子分组', parent_id=parent_group_id)
+        outside_group_id = self._create_group('标签筛选组外分组')
+        tag_a_id = self._create_tag('范围标签 A')
+        tag_b_id = self._create_tag('范围标签 B')
+        parent_a_only_id = self._insert_account('scope-parent-a@example.com', group_id=parent_group_id)
+        child_a_only_id = self._insert_account('scope-child-a@example.com', group_id=child_group_id)
+        child_a_and_b_id = self._insert_account('scope-child-a-b@example.com', group_id=child_group_id)
+        outside_a_only_id = self._insert_account('scope-outside-a@example.com', group_id=outside_group_id)
+
+        for account_id in (parent_a_only_id, child_a_only_id, child_a_and_b_id, outside_a_only_id):
+            self._tag_account(account_id, tag_a_id)
+        self._tag_account(child_a_and_b_id, tag_b_id)
+
+        list_query = [
+            ('group_id', str(parent_group_id)),
+            ('tag_ids', str(tag_a_id)),
+            ('exclude_tag_ids', str(tag_b_id)),
+            ('limit', '1'),
+            ('sort_by', 'email'),
+            ('sort_order', 'asc'),
+        ]
+        first_page_response = self.client.get('/api/accounts', query_string=list_query)
+        self.assertEqual(first_page_response.status_code, 200)
+        first_page = first_page_response.get_json()
+        self.assertTrue(first_page['success'])
+        self.assertEqual(first_page['total'], 2)
+        self.assertTrue(first_page['has_more'])
+        self.assertEqual([account['id'] for account in first_page['accounts']], [child_a_only_id])
+
+        second_page_response = self.client.get('/api/accounts', query_string=list_query + [('offset', '1')])
+        self.assertEqual(second_page_response.status_code, 200)
+        second_page = second_page_response.get_json()
+        self.assertTrue(second_page['success'])
+        self.assertEqual(second_page['total'], 2)
+        self.assertFalse(second_page['has_more'])
+        self.assertEqual([account['id'] for account in second_page['accounts']], [parent_a_only_id])
+
+        search_query = [(key, value) for key, value in list_query if key != 'limit'] + [
+            ('q', 'scope-'),
+            ('limit', '10'),
+        ]
+        search_response = self.client.get('/api/accounts/search', query_string=search_query)
+        self.assertEqual(search_response.status_code, 200)
+        search_payload = search_response.get_json()
+        self.assertTrue(search_payload['success'])
+        self.assertEqual(search_payload['total'], 2)
+        self.assertEqual(
+            {account['id'] for account in search_payload['accounts']},
+            {parent_a_only_id, child_a_only_id},
+        )
+        self.assertNotIn(child_a_and_b_id, [account['id'] for account in search_payload['accounts']])
+        self.assertNotIn(outside_a_only_id, [account['id'] for account in search_payload['accounts']])
 
     def test_add_account_without_sort_order_uses_created_at_fallback(self):
         response = self.client.post(
@@ -2514,25 +2798,35 @@ class FrontendAccountListPreferenceTests(unittest.TestCase):
         tags_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '09-tags.js').read_text(encoding='utf-8')
 
         self.assertIn("const ACCOUNT_TAG_FILTER_STORAGE_KEY = 'outlook_account_tag_filters';", groups_js)
+        self.assertIn("const ACCOUNT_TAG_EXCLUDE_FILTER_STORAGE_KEY = 'outlook_account_tag_exclude_filters';", groups_js)
         self.assertIn('function loadAccountTagFilterPreference()', groups_js)
         self.assertIn('function saveAccountTagFilterPreference()', groups_js)
+        self.assertIn('function loadAccountTagExcludeFilterPreference()', groups_js)
+        self.assertIn('function saveAccountTagExcludeFilterPreference()', groups_js)
         self.assertIn('selectedTagFilters = loadAccountTagFilterPreference();', groups_js)
+        self.assertIn('excludedTagFilters = loadAccountTagExcludeFilterPreference();', groups_js)
 
-        tag_change_start = groups_js.index('function handleTagFilterChange()')
-        tag_change_end = groups_js.index('// 防抖函数', tag_change_start)
+        tag_change_start = groups_js.index('function applyAccountTagFilterChange()')
+        tag_change_end = groups_js.index('function setAccountTagFilterSelection', tag_change_start)
         tag_change_source = groups_js[tag_change_start:tag_change_end]
         self.assertIn('saveAccountTagFilterPreference();', tag_change_source)
+        self.assertIn('saveAccountTagExcludeFilterPreference();', tag_change_source)
+        self.assertIn('syncAccountTagFilterOptions();', tag_change_source)
 
         load_tags_start = tags_js.index('async function loadTags()')
-        load_tags_end = tags_js.index('function getSelectedTagFilterItems()', load_tags_start)
+        load_tags_end = tags_js.index('function getTagFilterSummaryText()', load_tags_start)
         load_tags_source = tags_js[load_tags_start:load_tags_end]
-        self.assertIn('loadAccountTagFilterPreference()', load_tags_source)
+        self.assertIn('pruneAccountTagFilterSelections();', load_tags_source)
         self.assertIn('saveAccountTagFilterPreference();', load_tags_source)
+        self.assertIn('saveAccountTagExcludeFilterPreference();', load_tags_source)
 
         clear_start = tags_js.index('function clearTagFilterSelection')
         clear_end = tags_js.index('// 更新标签筛选下拉框', clear_start)
         clear_source = tags_js[clear_start:clear_end]
-        self.assertIn('saveAccountTagFilterPreference();', clear_source)
+        self.assertIn('excludedTagFilters = new Set();', clear_source)
+        self.assertIn('handleTagFilterChange();', clear_source)
+        self.assertNotIn('UNTAGGED_TAG_FILTER', tags_js)
+        self.assertNotIn('include_untagged', groups_js)
 
 
 class FrontendEmailListSecurityTests(unittest.TestCase):
@@ -2683,7 +2977,9 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
     def test_temp_email_list_uses_selected_tag_filters(self):
         temp_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '03-temp-emails.js').read_text(encoding='utf-8')
 
-        self.assertIn('selectedTagFilters.size > 0', temp_js)
+        self.assertIn('hasActiveTagFilters()', temp_js)
+        self.assertIn('matchesSelectedTagFilters(email.tags)', temp_js)
+        self.assertNotIn('selectedTagFilters.size > 0', temp_js)
         self.assertNotIn('selectedTagIds', temp_js)
 
     def test_temp_email_cloudflare_global_search_is_case_insensitive(self):
@@ -2971,12 +3267,51 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
         self.assertIn('grid-column: 2;', settings_css)
         self.assertIn('grid-row: 1;', settings_css)
 
-    def test_version_popover_mentions_docker_only_online_update_setup(self):
+    def test_version_popover_exposes_windows_and_docker_online_update(self):
         layout_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'layout.html').read_text(encoding='utf-8')
+        dialogs_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'dialogs-management.html').read_text(encoding='utf-8')
+        core_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '01-core.js').read_text(encoding='utf-8')
 
-        self.assertIn('仅 Docker 版本支持在线更新', layout_html)
-        self.assertIn('README 中的「启用界面 Docker 在线更新」', layout_html)
+        self.assertIn('Windows 桌面版与启用后的 Docker 部署支持在线更新', layout_html)
         self.assertIn('https://github.com/assast/outlookEmail#readme', layout_html)
+        self.assertIn('id="appVersionWindowsUpdateBtn"', layout_html)
+        self.assertIn('id="releaseNoticeWindowsUpdateBtn"', dialogs_html)
+        self.assertIn('id="windowsUpdateProgressBar"', dialogs_html)
+        self.assertIn('id="windowsUpdateCancelBtn"', dialogs_html)
+        self.assertIn("function startWindowsUpdate()", core_js)
+        self.assertIn("function waitForWindowsUpdateRestart(targetVersion)", core_js)
+
+    def test_windows_update_progress_is_above_release_notes_and_scrolled_into_view(self):
+        dialogs_html = pathlib.Path(
+            ROOT_DIR,
+            'templates',
+            'partials',
+            'index',
+            'dialogs-management.html',
+        ).read_text(encoding='utf-8')
+        core_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '01-core.js').read_text(encoding='utf-8')
+        release_modal = dialogs_html.split('id="releaseNoticeModal"', 1)[1].split(
+            '<!-- Outlook 上传账号模态框 -->',
+            1,
+        )[0]
+
+        self.assertLess(
+            release_modal.index('id="releaseNoticeVersionSummary"'),
+            release_modal.index('id="releaseNoticeHint"'),
+        )
+        self.assertLess(
+            release_modal.index('id="releaseNoticeHint"'),
+            release_modal.index('id="windowsUpdateProgress"'),
+        )
+        self.assertLess(
+            release_modal.index('id="windowsUpdateProgress"'),
+            release_modal.index('id="releaseNoticeNotesList"'),
+        )
+        self.assertIn('function scrollWindowsUpdateProgressIntoView()', core_js)
+        self.assertIn("progressPanel.closest('.release-notice-modal-content')", core_js)
+        self.assertIn("modalContent.scrollTo({ top: 0, behavior: 'smooth' });", core_js)
+        self.assertIn("progressPanel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });", core_js)
+        self.assertIn('scrollWindowsUpdateProgressIntoView();', core_js)
 
     def test_version_chip_shows_upgrade_badge_markup_and_logic(self):
         layout_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'layout.html').read_text(encoding='utf-8')
@@ -3005,7 +3340,15 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
         self.assertIn('updateButton.hidden = !(enabled && updateAvailable);', core_js)
         self.assertIn('updateButton.disabled = !available || running;', core_js)
         self.assertIn("const dockerHint = document.getElementById('releaseNoticeDockerHint');", core_js)
-        self.assertIn('dockerHint.hidden = !updateAvailable || available;', core_js)
+        self.assertIn('function refreshOnlineUpdateHint()', core_js)
+        self.assertIn('|| windowsEnabled', core_js)
+        self.assertIn('.windows-update-progress[hidden] {', pathlib.Path(
+            ROOT_DIR,
+            'static',
+            'css',
+            'index',
+            '06-modals-toast.css',
+        ).read_text(encoding='utf-8'))
         self.assertIn('.app-version-chip__upgrade-badge {', navbar_css)
         self.assertIn('background: linear-gradient(180deg, #fef3c7 0%, #fde68a 100%);', navbar_css)
         self.assertIn('color: #92400e;', navbar_css)
